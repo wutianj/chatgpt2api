@@ -1,0 +1,32 @@
+services:
+  app:
+    image: ${CHATGPT2API_IMAGE:-ghcr.io/yukkcat/chatgpt2api:latest}
+    container_name: chatgpt2api
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:80/version', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    ports:
+      - "${CHATGPT2API_PORT:-3000}:80"
+    volumes:
+      - chatgpt2api-runtime:/app
+      - ./data:/app/data
+      - ./config.json:/app/config.json
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-}
+      CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
+      CHATGPT2API_BASE_URL: ${CHATGPT2API_BASE_URL:-}
+      CHATGPT2API_CANVAS_TOKEN_TTL_SECONDS: ${CHATGPT2API_CANVAS_TOKEN_TTL_SECONDS:-86400}
+      CHATGPT2API_PAYMENT_WEBHOOK_SECRET: ${CHATGPT2API_PAYMENT_WEBHOOK_SECRET:-}
+      CHATGPT2API_CHAT_COST_UNITS: ${CHATGPT2API_CHAT_COST_UNITS:-1}
+      CHATGPT2API_IMAGE_COST_UNITS: ${CHATGPT2API_IMAGE_COST_UNITS:-10}
+      CHATGPT2API_SEARCH_COST_UNITS: ${CHATGPT2API_SEARCH_COST_UNITS:-2}
+      CHATGPT2API_FILE_COST_UNITS: ${CHATGPT2API_FILE_COST_UNITS:-20}
+      CHATGPT2API_THREAD_TOKENS: ${CHATGPT2API_THREAD_TOKENS:-120}
+      TZ: ${TZ:-Asia/Shanghai}
+
+volumes:
+  chatgpt2api-runtime:
