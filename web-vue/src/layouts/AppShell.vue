@@ -1030,10 +1030,10 @@ type HeaderServiceItem = {
 
 const headerServiceItems: HeaderServiceItem[] = [
   {
-    key: 'service-qq',
-    label: 'QQ 交流群：1005859624',
-    href: 'https://qm.qq.com/q/yegwCqJisS',
-    icon: 'lucide:messages-square',
+    key: 'service-tg',
+    label: 'TG 联系：@light121dd',
+    href: 'https://t.me/light121dd',
+    icon: 'lucide:send',
   },
   {
     key: 'service-account',

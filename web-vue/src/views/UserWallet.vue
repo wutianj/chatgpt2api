@@ -86,7 +86,7 @@
           </div>
           <div class="text-right">
             <p class="text-sm font-semibold tabular-nums" :class="item.amount_units >= 0 ? 'text-emerald-600' : 'text-foreground'">
-              {{ item.amount_units >= 0 ? '+' : '' }}{{ formatCredits(item.amount_units) }}
+              {{ formatLedgerAmount(item.amount_units) }}
             </p>
             <p class="mt-1 text-xs text-muted-foreground">余额 {{ formatCredits(item.balance_after) }}</p>
           </div>
@@ -103,7 +103,7 @@ import PageLoadingState from '@/components/ai/PageLoadingState.vue'
 import PagePanel from '@/components/ai/PagePanel.vue'
 import PanelHeader from '@/components/ai/PanelHeader.vue'
 import StateBlock from '@/components/ai/StateBlock.vue'
-import { billingApi, formatCredits, formatPrice, type Order, type Pricing, type Plan, type WalletView } from '@/api/billing'
+import { billingApi, formatCredits, formatLedgerAmount, formatPrice, type Order, type Pricing, type Plan, type WalletView } from '@/api/billing'
 import { useToast } from '@/composables/useToast'
 
 const toast = useToast()

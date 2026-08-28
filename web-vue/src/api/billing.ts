@@ -69,6 +69,11 @@ export function formatCredits(units: number) {
   return `${Math.max(0, Number(units) || 0).toLocaleString('zh-CN')} 点`
 }
 
+export function formatLedgerAmount(units: number) {
+  const value = Number(units) || 0
+  return `${value > 0 ? '+' : ''}${value.toLocaleString('zh-CN')} 点`
+}
+
 export function formatPrice(units: number) {
   return `¥${(Math.max(0, Number(units) || 0) / 100).toFixed(2)}`
 }

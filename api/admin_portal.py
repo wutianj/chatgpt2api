@@ -136,7 +136,15 @@ def create_router() -> APIRouter:
         if body.id.strip().lower() != plan_id.strip().lower():
             raise HTTPException(status_code=400, detail={"error": "套餐 ID 与路径不一致"})
         try:
-            plan = await run_in_threadpool(portal_repository.upsert_plan, **body.model_dump())
+            plan = await run_in_threadpool(
+                portal_repository.upsert_plan,
+                plan_id=body.id,
+                name=body.name,
+                price_units=body.price_units,
+                credits_units=body.credits_units,
+                validity_days=body.validity_days,
+                enabled=body.enabled,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         await run_in_threadpool(

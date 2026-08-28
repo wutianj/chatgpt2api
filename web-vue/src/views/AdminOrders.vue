@@ -54,9 +54,9 @@
         <PanelHeader title="套餐设置" align="start" />
         <span class="text-xs text-muted-foreground">修改只影响新订单，历史订单保留原金额</span>
       </div>
-      <StateBlock v-if="!plans.length" class="mt-4" compact dashed title="暂无套餐" description="默认套餐会在首次读取时创建。" />
+      <StateBlock v-if="!editablePlans.length" class="mt-4" compact dashed title="暂无套餐" description="默认套餐会在首次读取时创建。" />
       <div v-else class="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-        <div v-for="plan in plans" :key="plan.id" class="border border-border p-4">
+        <div v-for="plan in editablePlans" :key="plan.id" class="border border-border p-4">
           <div class="flex items-center justify-between gap-3">
             <p class="text-xs uppercase tracking-[0.18em] text-muted-foreground">{{ plan.id }}</p>
             <label class="flex items-center gap-2 text-xs text-muted-foreground">
@@ -194,6 +194,7 @@ const savingPlanId = ref('')
 const savingPricing = ref(false)
 const keyword = ref('')
 const statusFilter = ref('')
+const editablePlans = computed(() => plans.value.filter((plan) => plan.id !== 'custom'))
 const enabledPlans = computed(() => plans.value.filter((plan) => plan.id !== 'custom' && plan.enabled !== false))
 const canCreateCodes = computed(() => redeemMode.value === 'plan'
   ? Boolean(selectedPlan.value)
