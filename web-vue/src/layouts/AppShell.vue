@@ -1035,6 +1035,12 @@ const headerServiceItems: HeaderServiceItem[] = [
     href: 'https://t.me/light121dd',
     icon: 'lucide:send',
   },
+  {
+    key: 'service-redeem',
+    label: '购买兑换码',
+    href: 'https://pay.ldxp.cn/shop/404H1W99',
+    icon: 'lucide:package-plus',
+  },
 ]
 
 const mobileHeaderMenuItems = computed<ActionMenuItem[]>(() => {
