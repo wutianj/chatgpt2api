@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly chatgpt2api disk usage check
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=chatgpt2api-disk-alert.service
+
+[Install]
+WantedBy=timers.target

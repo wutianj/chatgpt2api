@@ -92,19 +92,23 @@ class Logger:
 
     def debug(self, message: Any) -> None:
         if self._enabled("debug"):
-            self._logger.debug(self._message(message))
+            formatted = self._message(message)
+            self._logger.debug(formatted)
 
     def info(self, message: Any) -> None:
         if self._enabled("info"):
-            self._logger.info(self._message(message))
+            formatted = self._message(message)
+            self._logger.info(formatted)
 
     def warning(self, message: Any) -> None:
         if self._enabled("warning"):
-            self._logger.warning(self._message(message))
+            formatted = self._message(message)
+            self._logger.warning(formatted)
 
     def error(self, message: Any) -> None:
         if self._enabled("error"):
-            self._logger.error(self._message(message))
+            formatted = self._message(message)
+            self._logger.error(formatted)
 
 
 logger = Logger()

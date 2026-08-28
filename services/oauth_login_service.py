@@ -1,14 +1,14 @@
 """手动 OAuth 桥服务
 
-让用户用自己浏览器走一遍 OpenAI 的标准 OAuth + PKCE 授权码流程：
+让用户用自己浏览器走一遍 Codex OAuth + PKCE 授权码流程：
   1. 后端生成 code_verifier / code_challenge / state，构造 authorize URL。
-  2. 用户在浏览器登录，浏览器最终被 OpenAI 重定向到 platform.openai.com 的
+  2. 用户在浏览器登录，浏览器最终被 OpenAI 重定向到 localhost:1455 的
      callback 地址；用户从地址栏或 devtools 抓出 code，回填到前端。
-  3. 后端拿之前存好的 code_verifier + 回填的 code 调用 /api/accounts/oauth/token
+  3. 后端拿之前存好的 code_verifier + 回填的 code 调用 /oauth/token
      得到 {access_token, refresh_token, id_token}。
 
-得到的 refresh_token 跟 account_service 自动刷新机制用的 client_id 是同一个
-（app_2SKx67EdpoN0G6j64rFvigXD），所以落盘后能直接进入 keepalive 周期。
+得到的 refresh_token 会连同 Codex client_id 落盘，account_service 后续按账号类型
+使用同一 client_id 自动续期；旧的 Web OAuth 账号仍按原 client_id 刷新。
 """
 from __future__ import annotations
 
@@ -22,15 +22,13 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from curl_cffi import requests
 
 from services.openai_oauth import (
-    auth_base,
-    common_headers,
-    platform_auth0_client,
-    platform_base,
-    platform_oauth_audience,
-    platform_oauth_client_id,
-    platform_oauth_redirect_uri,
-    sec_ch_ua,
-    user_agent,
+    codex_oauth_authorize_url,
+    codex_oauth_client_id,
+    codex_oauth_originator,
+    codex_oauth_redirect_uri,
+    codex_oauth_scope,
+    codex_oauth_token_url,
+    codex_oauth_user_agent,
 )
 from services.proxy_service import proxy_settings
 
@@ -73,33 +71,25 @@ class OAuthLoginService:
         finish 时即便前端 React 状态被覆盖也能从 URL 恢复正确的 verifier。
         """
         verifier, challenge = self._generate_pkce()
-        nonce = secrets.token_urlsafe(32)
-        device_id = str(uuid.uuid4())
         session_id = uuid.uuid4().hex
         state = f"{session_id}.{secrets.token_urlsafe(16)}"
 
         params = {
-            "issuer": auth_base,
-            "client_id": platform_oauth_client_id,
-            "audience": platform_oauth_audience,
-            "redirect_uri": platform_oauth_redirect_uri,
-            "device_id": device_id,
-            "screen_hint": "login_or_signup",
-            "max_age": "0",
-            "scope": "openid profile email offline_access",
             "response_type": "code",
-            "response_mode": "query",
+            "client_id": codex_oauth_client_id,
+            "redirect_uri": codex_oauth_redirect_uri,
+            "scope": codex_oauth_scope,
             "state": state,
-            "nonce": nonce,
             "code_challenge": challenge,
             "code_challenge_method": "S256",
-            "auth0Client": platform_auth0_client,
+            "id_token_add_organizations": "true",
+            "codex_cli_simplified_flow": "true",
         }
         email_hint = str(email_hint or "").strip()
         if email_hint:
             params["login_hint"] = email_hint
 
-        authorize_url = f"{auth_base}/api/accounts/authorize?{urlencode(params)}"
+        authorize_url = f"{codex_oauth_authorize_url}?{urlencode(params)}"
 
         with self._lock:
             self._purge_expired_locked()
@@ -107,14 +97,14 @@ class OAuthLoginService:
                 "code_verifier": verifier,
                 "state": state,
                 "created_at": time.time(),
-                "redirect_uri": platform_oauth_redirect_uri,
+                "redirect_uri": codex_oauth_redirect_uri,
             }
 
         return {
             "session_id": session_id,
             "authorize_url": authorize_url,
             "expires_in": str(self._SESSION_TTL_SECONDS),
-            "redirect_uri_prefix": platform_oauth_redirect_uri,
+            "redirect_uri_prefix": codex_oauth_redirect_uri,
         }
 
     @staticmethod
@@ -183,7 +173,7 @@ class OAuthLoginService:
         tokens = self._exchange_code(
             code,
             session["code_verifier"],
-            session.get("redirect_uri") or platform_oauth_redirect_uri,
+            session.get("redirect_uri") or codex_oauth_redirect_uri,
         )
         # 仅在成功兑换之后才消耗 session
         with self._lock:
@@ -192,26 +182,24 @@ class OAuthLoginService:
 
     @staticmethod
     def _exchange_code(code: str, code_verifier: str, redirect_uri: str) -> dict[str, str]:
-        """调用 /api/accounts/oauth/token 用 code+verifier 换 token 三件套。"""
+        """调用 Codex OAuth token endpoint，用 code+verifier 换 token 三件套。"""
         kwargs = proxy_settings.build_session_kwargs(impersonate="chrome", verify=False)
         session = requests.Session(**kwargs)
         try:
             response = session.post(
-                f"{auth_base}/api/accounts/oauth/token",
+                codex_oauth_token_url,
                 headers={
-                    **common_headers,
-                    "referer": f"{platform_base}/",
-                    "origin": platform_base,
-                    "auth0-client": platform_auth0_client,
-                    "sec-ch-ua": sec_ch_ua,
-                    "user-agent": user_agent,
+                    "Accept": "application/json",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": codex_oauth_user_agent,
+                    "originator": codex_oauth_originator,
                 },
-                json={
-                    "client_id": platform_oauth_client_id,
-                    "code_verifier": code_verifier,
+                data={
                     "grant_type": "authorization_code",
+                    "client_id": codex_oauth_client_id,
                     "code": code,
                     "redirect_uri": redirect_uri,
+                    "code_verifier": code_verifier,
                 },
                 timeout=60,
             )
@@ -236,7 +224,7 @@ class OAuthLoginService:
                     detail = ""
             # 打到 docker logs 方便排错——OAuth 换 token 的失败原因往往只有这里能看到
             print(
-                f"[oauth-login] /api/accounts/oauth/token rejected: "
+                f"[oauth-login] /oauth/token rejected: "
                 f"status={response.status_code} detail={detail!r} "
                 f"raw_body={(getattr(response, 'text', '') or '')[:500]!r}",
                 flush=True,
@@ -261,6 +249,7 @@ class OAuthLoginService:
             "access_token": access_token,
             "refresh_token": refresh_token,
             "id_token": id_token,
+            "client_id": codex_oauth_client_id,
         }
 
 

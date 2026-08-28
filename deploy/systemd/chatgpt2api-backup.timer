@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily chatgpt2api backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=15m
+Persistent=true
+Unit=chatgpt2api-backup.service
+
+[Install]
+WantedBy=timers.target

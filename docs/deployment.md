@@ -1,359 +1,190 @@
-# 部署与升级指南
+# 部署与升级
 
-本文介绍 ChatGPT2API 的常见部署方式，以及后续升级项目时需要保留的数据和执行步骤。
+状态：当前
 
-## 部署前准备
+本项目的发布镜像默认是 `ghcr.io/yukkcat/chatgpt2api:latest`。标准 Compose 将服务暴露在 `3000` 端口，使用 `chatgpt2api-runtime` 命名卷保存可更新的应用运行目录，并单独挂载本地 `data/` 和 `config.json`。运行时配置和数据不应提交到 Git。
 
-服务器需要安装：
-
-- Docker
-- Docker Compose v2
-- Git
-
-首次部署前建议确认：
+## Docker 部署
 
 ```bash
-docker version
-docker compose version
-git --version
-```
-
-项目核心持久化文件：
-
-| 路径 | 作用 |
-| --- | --- |
-| `config.json` | 主配置、后台密钥、代理、图片、备份等配置 |
-| `.env` | Docker compose 环境变量 |
-| `data/` | 账号、日志、图片、任务记录等运行数据 |
-
-升级和迁移时重点保留以上内容。
-
-## 方式一：普通 Docker 部署
-
-适合不需要 WARP / FlareSolverr 清障的场景。
-
-```bash
-git clone git@github.com:basketikun/chatgpt2api.git
+git clone https://github.com/yukkcat/chatgpt2api.git
 cd chatgpt2api
-```
-
-设置 `config.json` 中的 `auth-key`，或在 `docker-compose.yml` 中配置：
-
-```yaml
-environment:
-  - CHATGPT2API_AUTH_KEY=your_secret_key
-```
-
-启动：
-
-```bash
+cp .env.example .env
+# 将 .env 中的 CHATGPT2API_AUTH_KEY=your_secret_key_here 替换为私有密钥。
+test -f config.json || printf '{}\n' > config.json
 docker compose up -d
 ```
 
-访问：
-
-```text
-http://localhost:3000
-```
-
-API 基础地址：
-
-```text
-http://localhost:3000/v1
-```
-
-查看日志：
+使用本地构建的统一门户生产镜像时，使用生产 Compose 文件：
 
 ```bash
-docker logs -f chatgpt2api
+docker compose -f deploy/docker-compose.prod.yml up -d
 ```
 
-停止：
+服务器启用定时备份和磁盘告警：
 
 ```bash
-docker compose down
+install -m 700 deploy/backup.sh deploy/disk-alert.sh /opt/chatgpt2api/deploy/
+install -m 644 deploy/systemd/*.service deploy/systemd/*.timer /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now chatgpt2api-backup.timer chatgpt2api-disk-alert.timer
 ```
 
-## 方式二：WARP / FlareSolverr 部署
+镜像中的 `/opt/chatgpt2api` 是只读应用种子，`/app` 是受管运行目录。首次启动或镜像版本变化时，入口脚本会用镜像种子刷新 `/app`，再按锁文件同步 Python 依赖；同一镜像正常重启时会保留控制台在线更新后的运行版本。业务数据始终留在独立的 `data/` 挂载中。
 
-适合上游请求经常遇到 Cloudflare 拦截的场景。该方式会启动：
+### 本地 PostgreSQL 18
 
-- `warp-proxy`
-- `privoxy`
-- `flaresolverr`
-- `init-config`
-- `app`
+需要由 Compose 一并运行 PostgreSQL 时，在 `.env` 中设置数据库密码：
 
-复制环境变量模板：
+```dotenv
+POSTGRES_PASSWORD=replace_with_a_strong_password
+```
+
+然后同时加载基础 Compose 和 PostgreSQL overlay：
 
 ```bash
-cp .env.example .env
+docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d
 ```
 
-至少修改 `.env` 中的：
+`docker-compose.postgres.yml` 使用官方 `postgres:18-alpine` 镜像，等待数据库健康后再启动应用，并将数据持久化到 `chatgpt2api-postgres-data` 命名卷。数据库端口默认不暴露到宿主机。
 
-```text
-CHATGPT2API_AUTH_KEY=your_secret_key_here
-```
+`POSTGRES_PASSWORD` 会同时用于初始化数据库和构造 `DATABASE_URL`，因此请仅使用 URL 安全字符（字母、数字、下划线或连字符），不要在两个位置分别编码密码。
+启用该模式后，后续启动、升级、查看状态和停止服务都应同时指定这两个 Compose 文件。
 
-启动：
+查看状态与日志：
 
 ```bash
-docker compose -f docker-compose.warp.yml up -d --build
+docker compose -f docker-compose.yml -f docker-compose.postgres.yml ps
+docker compose -f docker-compose.yml -f docker-compose.postgres.yml logs -f postgres app
 ```
 
-访问：
+`.env` 中的 `CHATGPT2API_AUTH_KEY` 优先于 `config.json` 的 `auth-key`。若要使用 `config.json`，先删除或注释 `.env` 中的该值，再填写 `auth-key`。
 
-```text
-http://localhost:3000
-```
+统一门户打开外部无限画布时会签发短期 `canvas:ai` 令牌。默认有效期为 24 小时，可在 `.env` 中设置 `CHATGPT2API_CANVAS_TOKEN_TTL_SECONDS`，有效范围为 900 至 604800 秒。
 
-FlareSolverr 相关配置可以在后台设置页的 `FlareSolverr` tab 中查看和测试。
+默认地址：
 
-查看容器状态：
+- 控制台：`http://localhost:3000`
+- API：`http://localhost:3000/v1`
+
+统一用户门户的路由、订单履约、支付回调验签、审计和恢复命令见
+[`unified-portal.md`](unified-portal.md)。生产域名可以直接使用
+[`deploy/Caddyfile.prod`](../deploy/Caddyfile.prod) 作为 Caddy 配置模板。
+
+也可以使用仓库安装脚本：
 
 ```bash
-docker compose -f docker-compose.warp.yml ps
+curl -fsSL https://raw.githubusercontent.com/yukkcat/chatgpt2api/main/deploy/install.sh | sudo bash
 ```
 
-查看日志：
+安装脚本会明确询问 Application Database：
 
-```bash
-docker logs -f chatgpt2api-warp
-docker logs -f chatgpt2api-flaresolverr
-```
+- SQLite 本地文件（默认）
+- PostgreSQL 18 本地容器（Docker 模式）
+- 已有 PostgreSQL URL
 
-停止：
+选择本地 PostgreSQL 时，脚本会自动生成并保存数据库密码，下载 `docker-compose.postgres.yml`，再与主 Compose 一起启动。重复运行安装脚本会复用已有密码。`CHATGPT2API_THREAD_TOKENS` 默认是 `120`，表示后端同步工作线程的并发容量，只要求正整数且不设置人为最高值；账号、代理和上游服务仍分别执行自己的并发限制。
 
-```bash
-docker compose -f docker-compose.warp.yml down
-```
-
-## 方式三：源码运行
-
-适合本地开发或临时调试。
+## 本地开发
 
 后端：
 
 ```bash
-git clone git@github.com:basketikun/chatgpt2api.git
+git clone https://github.com/yukkcat/chatgpt2api.git
 cd chatgpt2api
 uv sync
 uv run main.py
 ```
 
-前端开发服务：
+Vue 控制台：
 
 ```bash
-cd web
-bun install
-bun run dev
+cd web-vue
+npm install
+npm run dev
 ```
 
-源码方式运行时，后端默认读取项目根目录的 `config.json` 和 `data/`。
+前端开发服务器默认使用 Vite 端口；后端仍读取项目根目录的 `config.json` 和 `data/`。
 
-## 存储后端
+## 存储边界
 
-默认使用本地 JSON 文件：
+`DATABASE_URL` 选择 Application Database；未设置时使用
+`data/chatgpt2api.db`。支持 SQLite 与 PostgreSQL 18，不再通过
+`STORAGE_BACKEND` 选择 JSON、Git 或账号专用数据库。
 
-```text
-STORAGE_BACKEND=json
-```
+选择数据库不是旧数据迁移操作，不会自动导入 JSON、JSONL、Git 或旧账号
+SQLite 文件。图片文件及其相关索引仍按图片存储边界管理。完整边界见
+[`storage-architecture.md`](storage-architecture.md)。
 
-可选值：
+## 升级
 
-| 值 | 说明 |
-| --- | --- |
-| `json` | 本地 JSON 文件，默认方式 |
-| `sqlite` | 本地 SQLite，通常存放在 `data/accounts.db` |
-| `postgres` | 外部 PostgreSQL |
-| `git` | Git 私有仓库存储账号数据 |
+升级前先在系统设置中执行一次 R2 备份，并确认状态为成功。备份归档始终包含
+Application Database：SQLite 使用 `data/application-database.sqlite3`，PostgreSQL
+使用 `data/application-database.pgdump`。图片任务记录、PPT / PSD 文件和图片目录
+按备份设置选择；外部 WebDAV 仍需独立备份。
 
-PostgreSQL 示例：
-
-```yaml
-environment:
-  - STORAGE_BACKEND=postgres
-  - DATABASE_URL=postgresql://user:password@host:5432/dbname
-```
-
-SQLite 示例：
-
-```yaml
-environment:
-  - STORAGE_BACKEND=sqlite
-  - DATABASE_URL=sqlite:////app/data/accounts.db
-```
-
-## 升级前备份
-
-升级前建议备份：
+未配置 R2 时，应先停止服务再备份。SQLite 可以在停服后复制 `data/chatgpt2api.db`；
+PostgreSQL 必须使用 `pg_dump --format=custom`，不能用 `tar data/` 代替数据库备份。
+`config.json` 只保留 `auth-key` 等启动配置，也应单独保存：
 
 ```bash
-mkdir -p backups
-tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz config.json .env data
+pg_dump --format=custom --no-owner --no-privileges "$DATABASE_URL" \
+  > backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).pgdump
 ```
 
-如果没有 `.env`，可以去掉：
+本地 PostgreSQL Compose 可直接在数据库容器内导出：
 
 ```bash
-tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz config.json data
+docker compose -f docker-compose.yml -f docker-compose.postgres.yml exec -T postgres \
+  sh -c 'pg_dump --format=custom --no-owner --no-privileges \
+  -U "$POSTGRES_USER" "$POSTGRES_DB"' \
+  > backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).pgdump
 ```
 
-也可以在后台设置页配置 Cloudflare R2 备份，用于定时备份关键数据。
+### 控制台在线更新
 
-## 升级：普通 Docker 部署
+使用当前标准 Compose 部署时，版本弹窗可直接启动在线更新。后端负责下载发布包、校验 SHA-256 与更新清单、替换运行文件、同步依赖和安排容器重启；前端只展示后端任务，刷新页面或重启完成后仍可恢复任务结果。文件或依赖同步失败时会恢复旧文件，并按旧锁文件重新同步依赖。
 
-进入项目目录：
-
-```bash
-cd chatgpt2api
-```
-
-备份：
+源码运行和没有挂载受管 `/app` 运行目录的旧容器不会显示“立即更新”，只会给出 Git 或镜像升级提示。首次切换到受管运行目录时，应先更新仓库中的 Compose 文件，再执行一次镜像升级：
 
 ```bash
-mkdir -p backups
-tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz config.json .env data
-```
-
-拉取最新代码和镜像：
-
-```bash
-git pull
+git pull --ff-only
 docker compose pull
 docker compose up -d
 ```
 
-查看状态：
+不要把 `/app` 运行时卷当作业务备份；它可以从发布镜像重新创建。不要使用 `docker compose down -v` 执行普通升级，因为该命令还会删除 Compose 管理的命名卷。
+
+### 命令行升级
+
+镜像部署升级：
 
 ```bash
-docker compose ps
-docker logs -f chatgpt2api
-```
-
-## 升级：WARP / FlareSolverr 部署
-
-进入项目目录：
-
-```bash
-cd chatgpt2api
-```
-
-备份：
-
-```bash
-mkdir -p backups
-tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz config.json .env data
-```
-
-拉取最新代码并重新构建：
-
-```bash
-git pull
-docker compose -f docker-compose.warp.yml up -d --build
-```
-
-查看状态：
-
-```bash
-docker compose -f docker-compose.warp.yml ps
-docker logs -f chatgpt2api-warp
-```
-
-## 升级：源码运行
-
-```bash
-cd chatgpt2api
-git pull
-uv sync
-```
-
-如果需要重新构建前端静态产物：
-
-```bash
-cd web
-bun install
-bun run build
-```
-
-然后按你的进程管理方式重启后端服务。
-
-## 回滚
-
-如果升级后需要回滚代码：
-
-```bash
-git log --oneline -n 20
-git checkout <旧版本commit>
-```
-
-普通 Docker 部署：
-
-```bash
+docker compose pull
 docker compose up -d
 ```
 
-WARP / FlareSolverr 部署：
+本地 PostgreSQL Compose 部署升级：
 
 ```bash
-docker compose -f docker-compose.warp.yml up -d --build
+docker compose -f docker-compose.yml -f docker-compose.postgres.yml pull
+docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d
 ```
 
-如果需要恢复数据：
-
-```bash
-tar -xzf backups/你的备份文件.tgz
-```
-
-恢复数据前建议先停止容器，避免运行中写入覆盖：
-
-```bash
-docker compose down
-```
-
-或：
-
-```bash
-docker compose -f docker-compose.warp.yml down
-```
-
-## 常用维护命令
-
-查看容器：
+镜像部署固定或回退版本时，在 `.env` 设置 `CHATGPT2API_IMAGE=ghcr.io/yukkcat/chatgpt2api:<tag>`，再执行对应的 `pull` 与 `up`。镜像版本变化后，入口脚本会用该镜像刷新受管运行目录；Git 检出标签只影响源码运行，不会改变 Compose 使用的镜像版本。升级后检查：
 
 ```bash
 docker compose ps
-```
-
-查看主服务日志：
-
-```bash
 docker logs -f chatgpt2api
 ```
 
-查看 WARP 部署主服务日志：
+## 回滚与维护
 
-```bash
-docker logs -f chatgpt2api-warp
-```
-
-重启普通部署：
+先停止对应 Compose，再恢复经过验证的代码 / 镜像和备份数据；不要在运行时直接覆盖 `data/`。常用命令：
 
 ```bash
 docker compose restart
+docker compose down
 ```
 
-重启 WARP 部署：
-
-```bash
-docker compose -f docker-compose.warp.yml restart
-```
-
-清理未使用镜像：
-
-```bash
-docker image prune
-```
-
-不要直接删除 `data/`、`config.json`、`.env`，除非已经确认有可用备份。
+`docker image prune` 只清理未使用镜像，不会替代数据备份。

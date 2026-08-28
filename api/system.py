@@ -1,19 +1,58 @@
 from __future__ import annotations
 
-from urllib.parse import quote
-
+from typing import Any
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 
+from api.call_contract import CallDetail, CallLogStatus, CallSummaryPage
+from api.dashboard_contract import DashboardResponseView
+from api.gallery_contract import (
+    GalleryCleanupResult,
+    GalleryCleanupTargetResult,
+    GalleryCompressResult,
+    GalleryGenBoxPushRequest,
+    GalleryGenBoxPushResult,
+    GalleryMediaFilter,
+    GalleryPage,
+)
+from api.monitor_contract import MonitorRecordDetailView, RealtimeMonitorView
+from contracts.auth import AuthView
+from contracts.models import ModelCatalogView
+from contracts.proxy import (
+    ProxyDefaultsMutation,
+    ProxyDefaultsRequest,
+    ProxyGroupDeleteMutation,
+    ProxyGroupMutation,
+    ProxyGroupPatch,
+    ProxyGroupTestResponse,
+    ProxyNodeImportRequest,
+    ProxyNodeImportResult,
+    ProxyView,
+)
+from contracts.settings import (
+    PublicThirdPartyAppsView,
+    SettingsMutationResult,
+    SettingsPatch,
+    SettingsView,
+)
+from contracts.updates import UpdateStatusView, UpdateTaskView
 from api.support import require_admin, require_identity, resolve_image_base_url
+from services.account_service import account_service
+from services.auth_view import build_auth_view
 from services.backup_service import BackupError, backup_service
 from services.config import config
+from services.gallery_view import (
+    gallery_cleanup_result,
+    gallery_cleanup_target_result,
+    gallery_compress_result,
+)
+from services.genbox_push_service import GenBoxPushError, push_gallery_image
 from services.image_service import (
+    cleanup_expired_images,
     compress_images,
     delete_images,
-    delete_to_target,
     download_images_zip,
     get_image_download_response,
     get_image_response,
@@ -21,14 +60,28 @@ from services.image_service import (
     list_images,
     storage_stats,
 )
+from services.dashboard_view import build_dashboard_view
 from services.image_storage_service import ImageStorageError, image_storage_service
-from services.image_tags_service import delete_tag, get_all_tags, set_tags
+from services.image_tags_service import set_tags
 from services.log_service import log_service
+from services.model_catalog_service import get_model_catalog
+from services.monitor_view import build_monitor_record_view, build_monitor_view
+from services.proxy_management_service import (
+    ProxyGroupInUseError,
+    normalize_proxy_node_url,
+    proxy_management_service,
+)
 from services.proxy_service import proxy_settings, test_clearance, test_proxy
-
-
-class SettingsUpdateRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
+from services.realtime_monitor_service import realtime_monitor_service
+from services.retention_cleanup_service import retention_cleanup_coordinator
+from services.settings_management_service import (
+    SettingsRevisionConflictError,
+    settings_management_service,
+)
+from services.storage.portal_repository import portal_repository
+from services.update_status_service import update_status_service
+from services.update_service import UpdateInstallError, update_service
+from utils.log import logger
 
 
 class ProxyTestRequest(BaseModel):
@@ -37,6 +90,12 @@ class ProxyTestRequest(BaseModel):
 
 class ClearanceTestRequest(BaseModel):
     target_url: str = "https://chatgpt.com"
+
+
+class ProxyGroupTestRequest(BaseModel):
+    id: str = ""
+    node_id: str = ""
+    url: str = ""
 
 
 class ImageDeleteRequest(BaseModel):
@@ -58,46 +117,196 @@ class BackupDeleteRequest(BaseModel):
     key: str = ""
 
 
+class RetentionCleanupRequest(BaseModel):
+    log_retention_hours: int | None = None
+    image_retention_hours: int | None = None
+
+
+class AccountCleanupRequest(BaseModel):
+    auto_remove_invalid_accounts: bool | None = None
+    auto_remove_rate_limited_accounts: bool | None = None
+
+
+def _clean_text(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _settings_write_error_message(exc: OSError) -> str:
+    return (
+        "保存设置失败：后端无法写入 Application Database。"
+        "请检查数据库连接、权限和磁盘空间。"
+        f"原始错误：{exc}"
+    )
+
+
+def _retention_cleanup_payload(body: RetentionCleanupRequest | None = None, *, dry_run: bool) -> dict[str, Any]:
+    body = body or RetentionCleanupRequest()
+    log_hours = body.log_retention_hours or config.log_retention_hours
+    image_hours = body.image_retention_hours or config.image_retention_hours
+    return retention_cleanup_coordinator.run_retention(
+        log_retention_hours=log_hours,
+        image_retention_hours=image_hours,
+        dry_run=dry_run,
+    )
+
+
+def _notify_retention_cleanup_if_changed(changed_fields: list[str]) -> None:
+    retention_fields = {"log_retention_hours", "image_retention_hours"}
+    if retention_fields.intersection(changed_fields):
+        retention_cleanup_coordinator.notify_retention_change()
+
+
+def _account_cleanup_payload(body: AccountCleanupRequest | None = None, *, dry_run: bool) -> dict[str, Any]:
+    body = body or AccountCleanupRequest()
+    kwargs = {
+        "remove_invalid": body.auto_remove_invalid_accounts,
+        "remove_rate_limited": body.auto_remove_rate_limited_accounts,
+    }
+    if dry_run:
+        return account_service.preview_auto_remove_accounts(**kwargs)
+    return account_service.cleanup_auto_remove_accounts(**kwargs)
+
+
+def _proxy_group_id(value: object) -> str:
+    raw = _clean_text(value)
+    if raw.lower().startswith("group:"):
+        raw = raw.split(":", 1)[1]
+    return raw.strip()
+
+
 def create_router(app_version: str) -> APIRouter:
     router = APIRouter()
 
-    @router.post("/auth/login")
+    @router.post("/auth/login", response_model=AuthView)
     async def login(authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
-        return {
-            "ok": True,
-            "version": app_version,
-            "role": identity.get("role"),
-            "subject_id": identity.get("id"),
-            "name": identity.get("name"),
-        }
+        return build_auth_view(app_version, identity)
+
+    @router.get("/auth/status", response_model=AuthView)
+    async def auth_status(authorization: str | None = Header(default=None)):
+        try:
+            identity = require_identity(authorization)
+        except HTTPException:
+            return build_auth_view(app_version)
+        return build_auth_view(app_version, identity)
 
     @router.get("/version")
     async def get_version():
         return {"version": app_version}
 
-    @router.get("/api/settings")
+    @router.get("/api/system/update-status", response_model=UpdateStatusView)
+    async def get_update_status(
+        force: bool = Query(default=False),
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        return await run_in_threadpool(update_status_service.view, app_version, force=force)
+
+    @router.get("/api/system/update-task", response_model=UpdateTaskView)
+    async def get_update_task(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return update_service.view(app_version)
+
+    @router.post("/api/system/update", response_model=UpdateTaskView, status_code=202)
+    async def start_update(authorization: str | None = Header(default=None)):
+        admin = require_admin(authorization)
+        try:
+            task = update_service.start(app_version)
+        except UpdateInstallError as exc:
+            raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
+        try:
+            await run_in_threadpool(
+                portal_repository.append_audit,
+                actor_id=str(admin.get("id") or "admin"),
+                actor_role="admin",
+                action="system_update_started",
+                target_type="system",
+                target_id=app_version,
+                metadata={"task_id": task.task_id},
+            )
+        except Exception as exc:
+            logger.warning({"event": "system_update_audit_failed", "error": str(exc)})
+        return task
+
+    @router.get("/api/settings", response_model=SettingsView)
     async def get_settings(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"config": config.get()}
+        return await run_in_threadpool(settings_management_service.view)
 
-    @router.get("/api/third-party-apps")
+    @router.get("/api/third-party-apps", response_model=PublicThirdPartyAppsView)
     async def get_third_party_apps(authorization: str | None = Header(default=None)):
         require_identity(authorization)
-        return {"third_party_apps": config.get_third_party_apps_settings()}
+        return await run_in_threadpool(settings_management_service.public_third_party_apps_view)
 
-    @router.post("/api/settings")
-    async def save_settings(body: SettingsUpdateRequest, authorization: str | None = Header(default=None)):
+    @router.patch("/api/settings", response_model=SettingsMutationResult)
+    async def save_settings(body: SettingsPatch, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         try:
-            return {"config": config.update(body.model_dump(mode="python"))}
+            result = await run_in_threadpool(settings_management_service.update, body)
+            _notify_retention_cleanup_if_changed(result.changed_fields)
+            return result
+        except SettingsRevisionConflictError as exc:
+            raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail={"error": _settings_write_error_message(exc)}) from exc
 
-    @router.get("/api/images")
-    async def get_images(request: Request, start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):
+    @router.post("/api/settings/retention-cleanup/preview")
+    async def preview_retention_cleanup(body: RetentionCleanupRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return list_images(resolve_image_base_url(request), start_date=start_date.strip(), end_date=end_date.strip())
+        return await run_in_threadpool(_retention_cleanup_payload, body, dry_run=True)
+
+    @router.post("/api/settings/retention-cleanup/run")
+    async def run_retention_cleanup(body: RetentionCleanupRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return await run_in_threadpool(_retention_cleanup_payload, body, dry_run=False)
+
+    @router.post("/api/settings/account-cleanup/preview")
+    async def preview_account_cleanup(body: AccountCleanupRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return await run_in_threadpool(_account_cleanup_payload, body, dry_run=True)
+
+    @router.post("/api/settings/account-cleanup/run")
+    async def run_account_cleanup(body: AccountCleanupRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return await run_in_threadpool(_account_cleanup_payload, body, dry_run=False)
+
+    @router.get("/api/model-catalog", response_model=ModelCatalogView)
+    async def model_catalog(authorization: str | None = Header(default=None)):
+        require_identity(authorization)
+        return await run_in_threadpool(get_model_catalog)
+
+    @router.get("/api/images", response_model=GalleryPage)
+    async def get_images(
+        request: Request,
+        start_date: str = "",
+        end_date: str = "",
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=24, ge=1, le=500),
+        media_type: GalleryMediaFilter = Query(default="all"),
+        tag: str = Query(default=""),
+        search: str = Query(default=""),
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        return await run_in_threadpool(
+            list_images,
+            resolve_image_base_url(request),
+            start_date=start_date.strip(),
+            end_date=end_date.strip(),
+            limit=page_size,
+            offset=(page - 1) * page_size,
+            media_type=media_type,
+            tag=tag.strip(),
+            search=search.strip(),
+        )
+
+    @router.post("/api/images/retention-cleanup", response_model=GalleryCleanupResult)
+    async def cleanup_expired_images_endpoint(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        result = await run_in_threadpool(cleanup_expired_images)
+        return gallery_cleanup_result(result)
 
     @router.get("/images/{image_path:path}", include_in_schema=False)
     async def get_image(image_path: str):
@@ -127,36 +336,201 @@ def create_router(app_version: str) -> APIRouter:
         require_admin(authorization)
         return get_image_download_response(image_path)
 
-    @router.get("/api/logs")
-    async def get_logs(type: str = "", start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):
+    @router.post("/api/images/genbox-push", response_model=GalleryGenBoxPushResult)
+    async def push_image_to_genbox(
+        body: GalleryGenBoxPushRequest,
+        authorization: str | None = Header(default=None),
+    ):
         require_admin(authorization)
-        return {"items": log_service.list(type=type.strip(), start_date=start_date.strip(), end_date=end_date.strip())}
+        try:
+            return await run_in_threadpool(push_gallery_image, body.path)
+        except GenBoxPushError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": exc.message},
+            ) from exc
+
+    @router.get("/api/logs", response_model=CallSummaryPage)
+    async def get_logs(
+        type: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        status: CallLogStatus = "",
+        endpoint: str = "",
+        model: str = "",
+        account: str = "",
+        conversation_id: str = "",
+        search: str = "",
+        limit: int = Query(default=200, ge=1, le=20000),
+        offset: int = Query(default=0, ge=0),
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        return await run_in_threadpool(
+            log_service.list_page,
+            type=type.strip(),
+            start_date=start_date.strip(),
+            end_date=end_date.strip(),
+            status=status.strip(),
+            endpoint=endpoint.strip(),
+            model=model.strip(),
+            account=account.strip(),
+            conversation_id=conversation_id.strip(),
+            search=search.strip(),
+            limit=limit,
+            offset=offset,
+        )
+
+    @router.get("/api/logs/{log_id}", response_model=CallDetail)
+    async def get_log_detail(log_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        detail = await run_in_threadpool(log_service.get_detail, log_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail={"error": "log not found"})
+        return detail
 
     @router.post("/api/logs/delete")
     async def delete_logs(body: LogDeleteRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return log_service.delete(body.ids)
+        return await run_in_threadpool(log_service.delete, body.ids)
+
+    @router.get(
+        "/api/monitor/realtime",
+        response_model=RealtimeMonitorView,
+        response_model_exclude_none=True,
+    )
+    async def get_realtime_monitor(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return build_monitor_view(realtime_monitor_service.snapshot())
+
+    @router.get(
+        "/api/monitor/realtime/{call_id}",
+        response_model=MonitorRecordDetailView,
+        response_model_exclude_none=True,
+    )
+    async def get_realtime_monitor_call(
+        call_id: str,
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        record = realtime_monitor_service.call_detail(call_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail={"error": "monitor call not found"})
+        return build_monitor_record_view(record)
 
     @router.post("/api/proxy/test")
     async def test_proxy_endpoint(body: ProxyTestRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"result": await run_in_threadpool(test_proxy, (body.url or "").strip())}
+        explicit_url = (body.url or "").strip()
+        if explicit_url:
+            try:
+                candidate = normalize_proxy_node_url(explicit_url)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        else:
+            candidate = proxy_settings.get_profile(upstream=True).proxy_url
+        if not candidate:
+            raise HTTPException(status_code=400, detail={"error": "proxy url is required"})
+        return {"result": await run_in_threadpool(test_proxy, candidate)}
+
+    @router.get("/api/proxy/view", response_model=ProxyView)
+    async def get_proxy_view(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return await run_in_threadpool(proxy_management_service.view)
+
+    @router.post("/api/proxy/defaults", response_model=ProxyDefaultsMutation)
+    async def save_proxy_defaults(
+        body: ProxyDefaultsRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        try:
+            return await run_in_threadpool(
+                proxy_management_service.save_defaults,
+                body.default_reference,
+                body.fallback_reference,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail={"error": _settings_write_error_message(exc)}) from exc
+
+    @router.post("/api/proxy/groups", response_model=ProxyGroupMutation)
+    async def save_proxy_group(body: ProxyGroupPatch, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        try:
+            return await run_in_threadpool(proxy_management_service.save_group, body)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail={"error": _settings_write_error_message(exc)}) from exc
+
+    @router.post("/api/proxy/nodes/import", response_model=ProxyNodeImportResult)
+    async def import_proxy_nodes(
+        body: ProxyNodeImportRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        try:
+            return await run_in_threadpool(
+                proxy_management_service.import_nodes,
+                body.text,
+                body.existing_urls,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+    @router.delete("/api/proxy/groups/{group_id}", response_model=ProxyGroupDeleteMutation)
+    async def delete_proxy_group(group_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        try:
+            return await run_in_threadpool(proxy_management_service.delete_group, group_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail={"error": str(exc.args[0])}) from exc
+        except ProxyGroupInUseError as exc:
+            raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail={"error": _settings_write_error_message(exc)}) from exc
+
+    @router.post("/api/proxy/groups/test", response_model=ProxyGroupTestResponse)
+    async def test_proxy_group_endpoint(body: ProxyGroupTestRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        explicit_url = (body.url or "").strip()
+        if explicit_url:
+            try:
+                candidate = normalize_proxy_node_url(explicit_url)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+            result = await run_in_threadpool(test_proxy, candidate)
+            return proxy_management_service.group_test_response([("", result)])
+
+        group_id = _proxy_group_id(body.id)
+        if not group_id:
+            raise HTTPException(status_code=400, detail={"error": "proxy group id or url is required"})
+        group_list = await run_in_threadpool(proxy_management_service.list_groups)
+        group = next((item for item in group_list.groups if item.id == group_id), None)
+        if group is None:
+            raise HTTPException(status_code=404, detail={"error": "proxy group not found"})
+        node_id = _clean_text(body.node_id)
+        nodes = [
+            node for node in group.nodes
+            if node.enabled
+            and node.url
+            and (not node_id or node.id == node_id)
+        ]
+        if not nodes:
+            raise HTTPException(status_code=400, detail={"error": "proxy group node url is required"})
+        results = [
+            (node.id, await run_in_threadpool(test_proxy, node.url))
+            for node in nodes
+        ]
+        return proxy_management_service.group_test_response(results)
 
     @router.get("/api/proxy/runtime")
     async def get_proxy_runtime_endpoint(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {
-            "runtime": config.get_public_proxy_runtime_settings(),
-            "status": proxy_settings.get_runtime_status(),
-        }
-
-    @router.post("/api/proxy/runtime")
-    async def save_proxy_runtime_endpoint(body: SettingsUpdateRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        try:
-            config.update({"proxy_runtime": body.model_dump(mode="python")})
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         return {
             "runtime": config.get_public_proxy_runtime_settings(),
             "status": proxy_settings.get_runtime_status(),
@@ -167,14 +541,15 @@ def create_router(app_version: str) -> APIRouter:
         require_admin(authorization)
         return {"result": await run_in_threadpool(test_clearance, body.target_url)}
 
-    @router.get("/api/storage/info")
-    async def get_storage_info(authorization: str | None = Header(default=None)):
+    @router.get("/api/dashboard", response_model=DashboardResponseView)
+    async def get_dashboard(
+        authorization: str | None = Header(default=None),
+    ):
         require_admin(authorization)
-        storage = config.get_storage_backend()
-        return {
-            "backend": storage.get_backend_info(),
-            "health": storage.health_check(),
-        }
+        return await run_in_threadpool(
+            build_dashboard_view,
+            app_version=app_version,
+        )
 
     @router.post("/api/backup/test")
     async def test_backup_connection(authorization: str | None = Header(default=None)):
@@ -204,7 +579,6 @@ def create_router(app_version: str) -> APIRouter:
             return {
                 "items": await run_in_threadpool(backup_service.list_backups),
                 "state": backup_service.get_status(),
-                "settings": backup_service.get_settings(),
             }
         except BackupError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
@@ -226,39 +600,6 @@ def create_router(app_version: str) -> APIRouter:
         except BackupError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
-    @router.get("/api/backups/detail")
-    async def get_backup_detail(key: str = "", authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        try:
-            return {"item": await run_in_threadpool(backup_service.get_backup_detail, key)}
-        except BackupError as exc:
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-
-    @router.get("/api/backups/download")
-    async def download_backup_endpoint(key: str = "", authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        try:
-            item = await run_in_threadpool(backup_service.download_backup, key)
-        except BackupError as exc:
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-        filename = str(item.get("name") or "backup.bin")
-        quoted = quote(filename)
-        headers = {
-            "Content-Disposition": f"attachment; filename*=UTF-8''{quoted}",
-            "Content-Length": str(int(item.get("size") or 0)),
-        }
-        return Response(
-            content=bytes(item.get("payload") or b""),
-            media_type=str(item.get("content_type") or "application/octet-stream"),
-            headers=headers,
-        )
-
-
-    @router.get("/api/images/tags")
-    async def list_image_tags(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return {"tags": get_all_tags()}
-
     @router.post("/api/images/tags")
     async def update_image_tags(body: ImageTagsRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
@@ -268,98 +609,36 @@ def create_router(app_version: str) -> APIRouter:
         tags = set_tags(rel, body.tags)
         return {"ok": True, "tags": tags}
 
-    @router.delete("/api/images/tags/{tag}")
-    async def delete_image_tag(tag: str, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        count = delete_tag(tag)
-        return {"ok": True, "removed_from": count}
-
     @router.get("/api/images/storage")
     async def get_image_storage(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return storage_stats()
 
-    @router.post("/api/images/storage/compress")
+    @router.post("/api/images/storage/compress", response_model=GalleryCompressResult)
     async def compress_all_images(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return await run_in_threadpool(compress_images)
+        result = await run_in_threadpool(compress_images)
+        return gallery_compress_result(result)
 
-    @router.post("/api/images/storage/cleanup-to-target")
+    @router.post(
+        "/api/images/storage/cleanup-to-target",
+        response_model=GalleryCleanupTargetResult,
+    )
     async def cleanup_to_target(
-        target_free_mb: int = 500,
+        target_free_mb: int = Query(default=500, ge=1),
         dry_run: bool = False,
         authorization: str | None = Header(default=None),
     ):
         require_admin(authorization)
-        return await run_in_threadpool(delete_to_target, target_free_mb, dry_run)
-
-    @router.get("/health", response_model=None)
-    async def health_dashboard(format: str = Query(default="html")):
-        from services.account_service import account_service as acct_svc
-        stats = acct_svc.get_stats()
-        storage = config.get_storage_backend()
-        storage_health = storage.health_check()
-        healthy = stats["active"] > 0
-
-        stats_json = {
-            "status": "ok" if healthy else "degraded",
-            "healthy": healthy,
-            "version": app_version,
-            "storage": {"backend": storage.get_backend_info(), "health": storage_health},
-            "proxy_runtime": proxy_settings.get_runtime_status(),
-            "accounts": stats,
-        }
-        if format == "json":
-            return stats_json
-        return HTMLResponse(f"""<!DOCTYPE html>
-<html lang="zh">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>号池健康监控 - chatgpt2api</title>
-<style>
-*{{margin:0;padding:0;box-sizing:border-box}}
-body{{font-family:system-ui,-apple-system,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}}
-.header{{background:#1a1d27;border-bottom:1px solid #2a2d3a;padding:16px 24px;display:flex;justify-content:space-between;align-items:center}}
-.header h1{{font-size:20px}}
-.status-dot{{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px}}
-.status-ok{{background:#22c55e;box-shadow:0 0 8px #22c55e88}}
-.status-degraded{{background:#f59e0b;box-shadow:0 0 8px #f59e0b88}}
-.container{{max-width:960px;margin:0 auto;padding:24px}}
-.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:24px}}
-.card{{background:#1a1d27;border:1px solid #2a2d3a;border-radius:10px;padding:16px}}
-.card .value{{font-size:28px;font-weight:700;margin:4px 0}}
-.card .label{{font-size:13px;color:#94a3b8}}
-.green{{color:#22c55e}}.yellow{{color:#f59e0b}}.red{{color:#ef4444}}.blue{{color:#6c63ff}}
-table{{width:100%;border-collapse:collapse;background:#1a1d27;border:1px solid #2a2d3a;border-radius:10px;overflow:hidden}}
-th{{background:#242836;font-weight:600;text-align:left;padding:10px 12px;font-size:12px;color:#94a3b8;text-transform:uppercase}}
-td{{padding:8px 12px;border-top:1px solid #2a2d3a;font-size:14px}}tr:hover td{{background:rgba(108,99,255,.05)}}
-.api-url{{font-family:monospace;font-size:12px;color:#6c63ff}}
-.refresh{{font-size:12px;color:#64748b;text-align:center;margin-top:24px}}
-</style>
-<meta http-equiv="refresh" content="30">
-</head>
-<body>
-<div class="header">
-<h1><span class="status-dot {'status-ok' if healthy else 'status-degraded'}"></span>号池健康监控</h1>
-<div style="font-size:13px;color:#94a3b8">v{app_version} · 30s 自动刷新</div>
-</div>
-<div class="container">
-<div class="cards">
-<div class="card"><div class="label">号池状态</div><div class="value {'green' if healthy else 'yellow'}">{'正常' if healthy else '异常'}</div></div>
-<div class="card"><div class="label">当前账号</div><div class="value blue">{stats['total']}</div></div>
-<div class="card"><div class="label">累计入库</div><div class="value">{stats['cumulative_total']}</div></div>
-<div class="card"><div class="label">可用账号</div><div class="value green">{stats['active']}</div></div>
-<div class="card"><div class="label">剩余额度</div><div class="value">{stats['total_quota']}</div></div>
-<div class="card"><div class="label">限流</div><div class="value yellow">{stats['limited']}</div></div>
-<div class="card"><div class="label">异常</div><div class="value red">{stats['abnormal']}</div></div>
-<div class="card"><div class="label">禁用</div><div class="value">{stats['disabled']}</div></div>
-<div class="card"><div class="label">成功/失败</div><div class="value">{stats['total_success']}<span style="font-size:18px;color:#94a3b8">/</span><span class="red">{stats['total_fail']}</span></div></div>
-</div>
-<h2 style="margin-bottom:12px;font-size:16px">账号类型分布</h2>
-<table>
-<tr><th>类型</th><th>数量</th></tr>
-{''.join(f'<tr><td>{t}</td><td>{c}</td></tr>' for t,c in sorted(stats['by_type'].items()))}
-</table>
-<div class="refresh">JSON: <span class="api-url">/health?format=json</span></div>
-</div></body></html>""")
+        result = await run_in_threadpool(
+            retention_cleanup_coordinator.cleanup_images_to_target,
+            target_free_mb,
+            dry_run=dry_run,
+        )
+        return gallery_cleanup_target_result(
+            result,
+            target_free_mb=target_free_mb,
+            dry_run=dry_run,
+        )
 
     return router
