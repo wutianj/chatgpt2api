@@ -379,6 +379,7 @@ class ImageTaskService:
         size: str | None = None,
         quality: str = "auto",
         base_url: str = "",
+        billing_resolution_callback: Callable[[list[str]], None] | None = None,
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
@@ -388,6 +389,7 @@ class ImageTaskService:
             "quality": quality,
             "response_format": "url",
             "base_url": base_url,
+            "_billing_resolution_callback": billing_resolution_callback,
         }
         return self._submit(identity, client_task_id=client_task_id, mode="generate", payload=payload)
 
@@ -405,6 +407,7 @@ class ImageTaskService:
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
         reservation: TaskReservation | None = None,
+        billing_resolution_callback: Callable[[list[str]], None] | None = None,
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
@@ -416,6 +419,7 @@ class ImageTaskService:
             "quality": quality,
             "response_format": "url",
             "base_url": base_url,
+            "_billing_resolution_callback": billing_resolution_callback,
         }
         return self._submit(
             identity,

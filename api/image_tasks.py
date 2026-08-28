@@ -159,6 +159,19 @@ async def _refund_image_task(identity: dict[str, object], *, amount: int, refere
     )
 
 
+def _adjust_image_task_billing(
+    identity: dict[str, object],
+    reference_id: str,
+    resolved_sizes: list[str],
+) -> None:
+    portal_billing.adjust_reserved_image_amount(
+        identity,
+        resolved_sizes=resolved_sizes,
+        reference_type="image_task",
+        reference_id=reference_id,
+    )
+
+
 async def filter_or_log(call: LoggedCall, text: str) -> None:
     try:
         await run_in_threadpool(check_request, text)
@@ -215,6 +228,9 @@ def create_router() -> APIRouter:
                 size=body.size,
                 quality=body.quality,
                 base_url=resolve_image_base_url(request),
+                billing_resolution_callback=lambda sizes: _adjust_image_task_billing(
+                    identity, reference_id, sizes
+                ),
             )
         except ImageTaskQueueFullError as exc:
             await _refund_image_task(identity, amount=charged_units, reference_id=reference_id)
@@ -274,6 +290,9 @@ def create_router() -> APIRouter:
                 images=images,
                 masks=masks,
                 reservation=reservation,
+                billing_resolution_callback=lambda sizes: _adjust_image_task_billing(
+                    identity, reference_id, sizes
+                ),
             )
         except ImageTaskQueueFullError as exc:
             await _refund_image_task(identity, amount=charged_units, reference_id=reference_id)

@@ -258,7 +258,7 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
         message_as_error=True,
         call_id=str(body.get("_call_id") or ""),
         trace_image_perf=bool(body.get("_trace_image_perf")),
-    )))
+    )), resolution_callback=body.get("_billing_resolution_callback"))
     response = completion_response(model, image_result_content(result), int(result.get("created") or 0) or None)
     if result.get("notice"):
         response["notice"] = result["notice"]
@@ -292,20 +292,31 @@ def image_chat_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         call_id=str(body.get("_call_id") or ""),
         trace_image_perf=bool(body.get("_trace_image_perf")),
     ))
-    yield from stream_image_chat_completion(image_outputs, model)
+    yield from stream_image_chat_completion(
+        image_outputs,
+        model,
+        resolution_callback=body.get("_billing_resolution_callback"),
+    )
 
 
-def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: str) -> Iterator[dict[str, Any]]:
+def stream_image_chat_completion(
+    image_outputs: Iterable[ImageOutput],
+    model: str,
+    resolution_callback: Any = None,
+) -> Iterator[dict[str, Any]]:
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     sent_role = False
     sent_text = ""
+    resolved_sizes: list[str] = []
     for output in image_outputs:
         content = ""
         if output.kind == "progress":
             content = output.text
             sent_text += content
         elif output.kind == "result":
+            if output.resolved_size and output.data:
+                resolved_sizes.extend([output.resolved_size] * len(output.data))
             content = build_chat_image_markdown_content({"data": output.data})
             if output.notice:
                 content = f"{output.notice}\n\n{content}"
@@ -336,6 +347,8 @@ def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: st
                 output.image_urls,
                 output.image_attempts,
             )
+    if callable(resolution_callback) and resolved_sizes:
+        resolution_callback(resolved_sizes)
     if not sent_role:
         yield completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created)
     yield completion_chunk(model, {}, "stop", completion_id, created)

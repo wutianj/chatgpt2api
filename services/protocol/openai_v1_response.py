@@ -378,6 +378,7 @@ def stream_image_response(
     input_image_tokens: int = 0,
     size: object = None,
     quality: str = "auto",
+    resolution_callback: Any = None,
 ) -> Iterator[dict[str, Any]]:
     response_id = f"resp_{uuid.uuid4().hex}"
     created = int(time.time())
@@ -421,6 +422,8 @@ def stream_image_response(
             continue
         items = image_output_items(prompt, output.data)
         if items:
+            if callable(resolution_callback) and output.resolved_size:
+                resolution_callback([output.resolved_size] * len(output.data))
             usage = image_usage(
                 input_text_tokens=count_text_tokens(prompt, model),
                 input_image_tokens=input_image_tokens,
@@ -491,7 +494,15 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         call_id=str(body.get("_call_id") or ""),
         trace_image_perf=bool(body.get("_trace_image_perf")),
     ))
-    yield from stream_image_response(image_outputs, prompt, model, input_image_tokens, tool.get("size"), str(tool.get("quality") or "auto"))
+    yield from stream_image_response(
+        image_outputs,
+        prompt,
+        model,
+        input_image_tokens,
+        tool.get("size"),
+        str(tool.get("quality") or "auto"),
+        body.get("_billing_resolution_callback"),
+    )
 
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:

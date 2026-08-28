@@ -286,6 +286,21 @@ async def _complete_call(call: LoggedCall) -> None:
         call.log("用量记录结算失败", status="failed", error=str(exc))
 
 
+def _attach_image_billing_callback(call: LoggedCall, payload: dict[str, object]) -> None:
+    if not call.image_request or not portal_billing.user_id(call.identity):
+        return
+
+    def adjust(resolved_sizes: list[str]) -> None:
+        portal_billing.adjust_reserved_image_amount(
+            call.identity,
+            resolved_sizes=resolved_sizes,
+            reference_type="api_call",
+            reference_id=call.call_id,
+        )
+
+    payload["_billing_resolution_callback"] = adjust
+
+
 def create_router() -> APIRouter:
     router = APIRouter()
 
@@ -434,6 +449,7 @@ def create_router() -> APIRouter:
         call.attach_trace_metadata(payload)
         await filter_or_log(call, body.prompt)
         charged_units = await _reserve_call(call, count=body.n, size=body.size)
+        _attach_image_billing_callback(call, payload)
         task_id = await _start_billed_user_task(call, body.prompt, "image", charged_units)
         try:
             result = await call.run(openai_v1_image_generations.handle, payload)
@@ -472,6 +488,7 @@ def create_router() -> APIRouter:
             count=int(payload.get("n") or 1),
             size=payload.get("size"),
         )
+        _attach_image_billing_callback(call, payload)
         task_id = await _start_billed_user_task(call, prompt, "image", charged_units)
         try:
             result = await call.run(openai_v1_image_edit.handle, payload)
@@ -507,6 +524,7 @@ def create_router() -> APIRouter:
             count=int(payload.get("n") or 1) if image_chat else 1,
             size=payload.get("size") if image_chat else None,
         )
+        _attach_image_billing_callback(call, payload)
         task_id = await _start_billed_user_task(
             call,
             request_preview,
@@ -550,6 +568,7 @@ def create_router() -> APIRouter:
             count=int(payload.get("n") or 1) if image_response else 1,
             size=payload.get("size") if image_response else None,
         )
+        _attach_image_billing_callback(call, payload)
         task_id = await _start_billed_user_task(call, request_preview, "image" if image_response else "chat", charged_units)
         try:
             result = await call.run(openai_v1_response.handle, payload)

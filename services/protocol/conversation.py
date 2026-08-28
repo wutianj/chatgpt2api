@@ -602,6 +602,7 @@ class ImageOutput:
     account_email: str = ""
     conversation_id: str = ""
     notice: str = ""
+    resolved_size: str = ""
     failure: ImageFailure | None = field(default=None, repr=False)
 
     def to_chunk(self) -> dict[str, Any]:
@@ -1665,6 +1666,7 @@ def _image_result_output_from_urls(
         image_urls=list(formatted.get("_image_urls") or []),
         conversation_id=conversation_id,
         notice=request.resolution_notice,
+        resolved_size=str(request.size or ""),
     )
 
 
@@ -2050,6 +2052,7 @@ def stream_codex_image_outputs(
             total=total,
             data=data,
             image_urls=list(formatted.get("_image_urls") or []),
+            resolved_size=str(request.size or ""),
         )
         return
     raise ImageGenerationError(
@@ -2992,12 +2995,16 @@ def stream_image_chunks(
     event_prefix: str = "image_generation",
     usage_builder: Callable[[list[dict[str, Any]]], dict[str, Any]] | None = None,
     partial_images: object = 0,
+    resolution_callback: Callable[[list[str]], None] | None = None,
 ) -> Iterator[dict[str, Any]]:
     prefix = str(event_prefix or "image_generation").strip() or "image_generation"
+    resolved_sizes: list[str] = []
     # ChatGPT Web only gives us final image bytes here. Emitting those bytes as a
     # synthetic partial_image makes some clients display the same image twice.
     for output in outputs:
         if output.kind == "result":
+            if output.resolved_size and output.data:
+                resolved_sizes.extend([output.resolved_size] * len(output.data))
             for item_index, item in enumerate(output.data):
                 if not isinstance(item, dict):
                     continue
@@ -3019,11 +3026,14 @@ def stream_image_chunks(
                 f"{prefix}.failed",
                 {"error": {"message": output.text, "type": "image_generation_error"}},
             )
+    if callable(resolution_callback) and resolved_sizes:
+        resolution_callback(resolved_sizes)
 
 
 def collect_image_outputs(
         outputs: Iterable[ImageOutput],
         result_callback: Callable[[list[dict[str, Any]]], None] | None = None,
+        resolution_callback: Callable[[list[str]], None] | None = None,
 ) -> dict[str, Any]:
     created = None
     data: list[dict[str, Any]] = []
@@ -3035,6 +3045,7 @@ def collect_image_outputs(
     image_attempts: list[dict[str, Any]] = []
     notice = ""
     failed_output: ImageOutput | None = None
+    resolved_sizes: list[str] = []
     for output in outputs:
         created = created or output.created
         if output.account_email and not account_email:
@@ -3055,6 +3066,8 @@ def collect_image_outputs(
         elif output.kind == "result":
             data.extend(output.data)
             image_urls.extend(output.image_urls)
+            if output.resolved_size and output.data:
+                resolved_sizes.extend([output.resolved_size] * len(output.data))
             if callable(result_callback) and output.data:
                 result_callback([dict(item) for item in data])
 
@@ -3070,6 +3083,9 @@ def collect_image_outputs(
             conversation_id=failed_output.conversation_id or conversation_id,
             image_attempts=image_attempts,
         )
+
+    if callable(resolution_callback) and resolved_sizes:
+        resolution_callback(resolved_sizes)
 
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
     if not data:

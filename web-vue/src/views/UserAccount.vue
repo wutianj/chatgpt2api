@@ -15,6 +15,7 @@
         <div v-else class="mt-4 divide-y divide-border"><div v-for="item in keys" :key="item.id" class="flex items-center justify-between gap-4 py-3"><div class="min-w-0"><p class="truncate text-sm font-medium text-foreground">{{ item.name }}</p><p class="mt-1 text-xs text-muted-foreground">创建于 {{ formatDate(item.created_at) }} · {{ item.enabled ? '启用中' : '已撤销' }}</p></div><Button v-if="item.enabled" size="sm" variant="outline" :disabled="busyId === item.id" @click="revokeKey(item.id)">{{ busyId === item.id ? '处理中...' : '撤销' }}</Button></div></div>
       </PagePanel>
     </div>
+    <UserApiDocs :revealed-key="newRawKey" />
     <PagePanel class="!rounded-xl">
       <PanelHeader title="最近用量" align="start" />
       <StateBlock v-if="!usage.length" class="mt-4" compact dashed title="暂无用量记录" description="完成一次对话或生图后会显示预扣和结算状态。" />
@@ -35,6 +36,7 @@ import PageLoadingState from '@/components/ai/PageLoadingState.vue'
 import PagePanel from '@/components/ai/PagePanel.vue'
 import PanelHeader from '@/components/ai/PanelHeader.vue'
 import StateBlock from '@/components/ai/StateBlock.vue'
+import UserApiDocs from '@/components/ai/UserApiDocs.vue'
 import { userApi, type UserKey, type UserProfile, type UsageRecord } from '@/api/user'
 import { formatCredits } from '@/api/billing'
 import { useToast } from '@/composables/useToast'

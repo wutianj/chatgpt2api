@@ -565,6 +565,70 @@ class PortalRepository:
             session.commit()
             return self._usage_dict(row)
 
+    def adjust_reserved_usage_amount(
+        self,
+        *,
+        user_id: str,
+        reference_type: str,
+        reference_id: str,
+        amount_units: int,
+    ) -> dict[str, Any] | None:
+        """Lower a reserved usage amount and return the difference atomically."""
+        if amount_units <= 0:
+            raise ValueError("实际扣除额度必须大于 0")
+        with self.Session() as session:
+            try:
+                if self.engine.dialect.name == "sqlite":
+                    session.execute(text("BEGIN IMMEDIATE"))
+                row = session.scalar(
+                    select(UsageRecordModel)
+                    .where(
+                        UsageRecordModel.user_id == user_id,
+                        UsageRecordModel.reference_type == reference_type,
+                        UsageRecordModel.reference_id == reference_id,
+                    )
+                    .with_for_update()
+                )
+                if row is None:
+                    session.commit()
+                    return None
+                current_amount = max(0, int(row.amount_units or 0))
+                if row.status != "reserved" or amount_units >= current_amount:
+                    session.commit()
+                    return self._usage_dict(row)
+
+                now = _utc_now()
+                refund_units = current_amount - amount_units
+                wallet = session.scalar(
+                    select(UserWalletModel)
+                    .where(UserWalletModel.user_id == user_id)
+                    .with_for_update()
+                )
+                if wallet is None:
+                    raise ValueError("用户钱包不存在，无法调整预扣额度")
+                wallet.balance_units = int(wallet.balance_units) + refund_units
+                wallet.updated_at = now
+                session.add(WalletLedgerModel(
+                    id=f"ledger_{uuid4().hex}",
+                    user_id=user_id,
+                    entry_type="refund",
+                    amount_units=refund_units,
+                    balance_after=int(wallet.balance_units),
+                    reference_type=reference_type,
+                    reference_id=reference_id,
+                    idempotency_key=(
+                        f"usage-adjustment:{reference_type}:{reference_id}:{amount_units}"
+                    ),
+                    created_at=now,
+                ))
+                row.amount_units = amount_units
+                row.updated_at = now
+                session.commit()
+                return self._usage_dict(row)
+            except Exception:
+                session.rollback()
+                raise
+
     def get_usage(
         self,
         *,

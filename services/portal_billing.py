@@ -248,6 +248,45 @@ class PortalBillingService:
             idempotency_key=f"usage-record:{reference_type}:{reference_id}",
         )
 
+    def adjust_reserved_amount(
+        self,
+        identity: dict[str, object],
+        *,
+        amount_units: int,
+        reference_type: str,
+        reference_id: str,
+    ) -> dict[str, Any] | None:
+        user_id = self.user_id(identity)
+        if not user_id or amount_units <= 0:
+            return None
+        return portal_repository.adjust_reserved_usage_amount(
+            user_id=user_id,
+            reference_type=reference_type,
+            reference_id=reference_id,
+            amount_units=amount_units,
+        )
+
+    def adjust_reserved_image_amount(
+        self,
+        identity: dict[str, object],
+        *,
+        resolved_sizes: object,
+        reference_type: str,
+        reference_id: str,
+    ) -> dict[str, Any] | None:
+        if not isinstance(resolved_sizes, (list, tuple)):
+            return None
+        sizes = [size for size in resolved_sizes if str(size or "").strip()]
+        if not sizes:
+            return None
+        amount_units = sum(self.image_cost_for_size(size) for size in sizes)
+        return self.adjust_reserved_amount(
+            identity,
+            amount_units=amount_units,
+            reference_type=reference_type,
+            reference_id=reference_id,
+        )
+
     def refund_reserved(
         self,
         identity: dict[str, object],

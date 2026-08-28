@@ -40,12 +40,17 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
             outputs,
             event_prefix="image_generation",
             partial_images=body.get("partial_images"),
+            resolution_callback=body.get("_billing_resolution_callback"),
             usage_builder=lambda data: image_usage(
                 input_text_tokens=input_text_tokens,
                 output_tokens=count_image_output_items_tokens(data, size, quality),
             ),
         )
-    result = collect_image_outputs(outputs, result_callback=body.get("_image_result_callback"))
+    result = collect_image_outputs(
+        outputs,
+        result_callback=body.get("_image_result_callback"),
+        resolution_callback=body.get("_billing_resolution_callback"),
+    )
     result["usage"] = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),
         output_tokens=count_image_output_items_tokens(result.get("data"), size, quality),
