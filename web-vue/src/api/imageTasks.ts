@@ -36,6 +36,7 @@ export interface ImageTask {
   elapsed_ms: number | null
   error_code: string
   public_error: string
+  notice: string
   results: ImageTaskAsset[]
   actions: ImageTaskActions
 }
@@ -154,9 +155,14 @@ export function supportsHighResolutionImageSizes(highResolutionEnabled = false) 
 }
 
 export function resolveImageSizePresets(highResolutionEnabled = false): ImageSizePreset[] {
-  return supportsHighResolutionImageSizes(highResolutionEnabled)
+  const presets = supportsHighResolutionImageSizes(highResolutionEnabled)
     ? IMAGE_SIZE_PRESETS
     : STANDARD_IMAGE_SIZE_PRESETS
+  // 2K is available through the paid-account fallback path; keep 4K reserved but hidden.
+  const withTwoK = highResolutionEnabled
+    ? presets
+    : [...presets, ...HIGH_RES_IMAGE_SIZE_PRESETS.filter((preset) => preset.resolution === '2K')]
+  return withTwoK.filter((preset) => preset.resolution !== '4K')
 }
 
 export function resolveImageSizeOptions(highResolutionEnabled = false): ImageSizeOption[] {
@@ -306,6 +312,7 @@ function parseImageTask(value: unknown, path = 'response'): ImageTask {
     elapsed_ms: expectNullableInteger(raw.elapsed_ms, `${path}.elapsed_ms`),
     error_code: expectString(raw.error_code, `${path}.error_code`),
     public_error: expectString(raw.public_error, `${path}.public_error`),
+    notice: expectString(raw.notice ?? '', `${path}.notice`),
     results,
     actions: {
       resume_poll: expectBoolean(actions.resume_poll, `${path}.actions.resume_poll`),

@@ -21,11 +21,16 @@ export interface Plan {
   price_units: number
   credits_units: number
   validity_days: number
+  enabled?: boolean
 }
 
 export interface Pricing {
   chat_cost_units: number
   image_cost_units: number
+  image_1k_cost_units: number
+  image_2k_cost_units: number
+  image_4k_cost_units: number
+  image_4k_enabled: boolean
   search_cost_units: number
   file_cost_units: number
 }

@@ -122,7 +122,7 @@ export const appRoutes: RouteRecordRaw[] = [
         path: 'orders',
         name: 'admin-orders',
         component: () => import('@/views/AdminOrders.vue'),
-        meta: { requiredCapability: 'admin_console', management: true },
+        meta: { requiredCapability: 'admin_console' },
       },
       {
         path: 'audit',

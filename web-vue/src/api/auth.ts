@@ -23,10 +23,6 @@ export interface AuthView {
   home_route: '/login' | '/' | '/admin' | '/studio'
 }
 
-export interface AdminLoginRequest {
-  password: string
-}
-
 export interface UserLoginRequest {
   email: string
   password: string
@@ -53,16 +49,6 @@ export interface UserSessionResponse {
 }
 
 export const authApi = {
-  async loginAdmin(data: AdminLoginRequest) {
-    setAuthToken(data.password)
-    try {
-      return await apiClient.post<never, AuthView>('/auth/login')
-    } catch (error) {
-      clearAuthToken()
-      throw error
-    }
-  },
-
   async loginUser(data: UserLoginRequest) {
     const session = await apiClient.post<UserLoginRequest, UserSessionResponse>('/api/auth/login', data)
     setAuthToken(session.access_token)

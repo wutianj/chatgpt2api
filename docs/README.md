@@ -52,6 +52,7 @@ Executable documentation rules live in
 | [`prompt-library-architecture.md`](prompt-library-architecture.md) | current | Prompt source and library projection lifecycle |
 | [`deployment.md`](deployment.md) | current | Docker, source development, backup, and upgrade guidance |
 | [`upstream-sse-conversation.md`](upstream-sse-conversation.md) | current | Internal Conversation SSE and result-resolution reference |
+| [`runbooks/reg2-account-import.md`](runbooks/reg2-account-import.md) | current | reg2 registration account export and account-pool import procedure |
 
 ## Documentation rules
 

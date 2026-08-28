@@ -10,6 +10,7 @@ Status: current
 | 操作 | 文档 |
 | --- | --- |
 | Docker 与源码部署、备份和升级 | [`../deployment.md`](../deployment.md) |
+| reg2 注册机账号导入账号池 | [`reg2-account-import.md`](reg2-account-import.md) |
 
 ## 编写要求
 

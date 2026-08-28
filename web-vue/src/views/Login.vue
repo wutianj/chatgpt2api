@@ -24,57 +24,28 @@
             <p class="mt-2 text-sm text-muted-foreground">登录后继续你的工作。</p>
           </div>
 
-          <div class="mt-8 grid grid-cols-2 gap-1 rounded-xl bg-muted p-1" role="tablist" aria-label="登录方式">
-            <button
-              type="button"
-              class="rounded-lg px-3 py-2 text-sm font-medium transition-colors"
-              :class="mode === 'user' ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground'"
-              role="tab"
-              :aria-selected="mode === 'user'"
-              @click="mode = 'user'"
-            >用户端</button>
-            <button
-              type="button"
-              class="rounded-lg px-3 py-2 text-sm font-medium transition-colors"
-              :class="mode === 'admin' ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground'"
-              role="tab"
-              :aria-selected="mode === 'admin'"
-              @click="mode = 'admin'"
-            >管理端</button>
-          </div>
-
-          <form v-if="mode === 'user'" class="mt-6 space-y-4" @submit.prevent="handleUserSubmit">
+          <form class="mt-8 space-y-4" @submit.prevent="handleUserSubmit">
             <div v-if="isRegistering" class="space-y-2">
               <label for="display-name" class="ui-field-label text-sm font-medium text-foreground">显示名称</label>
               <Input id="display-name" v-model="displayName" size="md" block placeholder="怎么称呼你" :disabled="isLoading" />
             </div>
             <div class="space-y-2">
-              <label for="email" class="ui-field-label text-sm font-medium text-foreground">邮箱</label>
-              <Input id="email" v-model="email" type="email" size="md" block placeholder="you@example.com" :disabled="isLoading" />
+              <label for="email" class="ui-field-label text-sm font-medium text-foreground">账号（邮箱）</label>
+              <Input id="email" v-model="email" type="email" size="md" block placeholder="输入注册邮箱" :disabled="isLoading" />
             </div>
             <div class="space-y-2">
               <label for="user-password" class="ui-field-label text-sm font-medium text-foreground">密码</label>
               <Input id="user-password" v-model="userPassword" type="password" size="md" block placeholder="至少 8 位" :disabled="isLoading" />
             </div>
             <Button type="submit" size="md" variant="primary" block :disabled="isLoading || !email || !userPassword">
-              {{ isLoading ? '处理中...' : (isRegistering ? '创建账户' : '进入工作台') }}
+              {{ isLoading ? '处理中...' : (isRegistering ? '创建账户' : '登录') }}
             </Button>
             <button type="button" class="block w-full text-center text-sm text-muted-foreground hover:text-foreground" @click="isRegistering = !isRegistering">
               {{ isRegistering ? '已有账户？返回登录' : '还没有账户？立即注册' }}
             </button>
           </form>
 
-          <form v-else class="mt-6 space-y-4" @submit.prevent="handleAdminSubmit">
-            <div class="space-y-2">
-              <label for="admin-password" class="ui-field-label text-sm font-medium text-foreground">管理员密钥</label>
-              <Input id="admin-password" v-model="adminPassword" type="password" size="md" block placeholder="输入 Bearer key" :disabled="isLoading" />
-            </div>
-            <Button type="submit" size="md" variant="primary" block :disabled="isLoading || !adminPassword">
-              {{ isLoading ? '登录中...' : '进入管理端' }}
-            </Button>
-          </form>
-
-          <p class="mt-8 text-center text-xs text-muted-foreground">管理员登录仅用于运维控制台，用户端不会显示账号池和更新入口。</p>
+          <p class="mt-8 text-center text-xs text-muted-foreground">管理员账号登录后自动进入管理后台，普通账号进入用户工作台。</p>
         </section>
       </div>
     </div>
@@ -94,12 +65,10 @@ const route = useRoute()
 const authStore = useAuthStore()
 const toast = useToast()
 
-const mode = ref<'user' | 'admin'>('user')
 const isRegistering = ref(false)
 const email = ref('')
 const displayName = ref('')
 const userPassword = ref('')
-const adminPassword = ref('')
 const isLoading = ref(false)
 
 async function finishLogin() {
@@ -122,17 +91,4 @@ async function handleUserSubmit() {
   }
 }
 
-async function handleAdminSubmit() {
-  if (!adminPassword.value) return
-  isLoading.value = true
-  try {
-    const loggedIn = await authStore.loginAdmin(adminPassword.value)
-    if (!loggedIn) throw new Error('管理员密钥无效或已失效。')
-    await finishLogin()
-  } catch (error: any) {
-    toast.error(error.message || '登录失败，请检查管理员密钥。')
-  } finally {
-    isLoading.value = false
-  }
-}
 </script>

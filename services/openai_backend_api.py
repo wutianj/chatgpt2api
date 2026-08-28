@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import mimetypes
 import os
@@ -246,47 +247,70 @@ class OpenAIBackendAPI:
             reserve_image_egress=reserve_image_egress,
             deadline_monotonic=deadline_monotonic,
         )
+        self._session_lease = None
         try:
-            self.session = requests.Session(**proxy_settings.build_session_kwargs_from_profile(
+            self._session_lease = proxy_settings.acquire_upstream_session(
                 self.proxy_profile,
+                owner_key=self._session_owner_key(),
                 impersonate=self.fp["impersonate"],
                 verify=True,
                 curl_infos=list(HTTP_TIMING_INFOS),
-            ))
+            )
+            self.session = self._session_lease.session
+            self._base_headers = {
+                "User-Agent": self.user_agent,
+                "Origin": self.base_url,
+                "Referer": self.base_url + "/",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+                "Priority": "u=1, i",
+                "Sec-Ch-Ua": self.fp["sec-ch-ua"],
+                "Sec-Ch-Ua-Arch": '"x86"',
+                "Sec-Ch-Ua-Bitness": '"64"',
+                "Sec-Ch-Ua-Full-Version": '"143.0.3650.96"',
+                "Sec-Ch-Ua-Full-Version-List": '"Microsoft Edge";v="143.0.3650.96", "Chromium";v="143.0.7499.147", "Not A(Brand";v="24.0.0.0"',
+                "Sec-Ch-Ua-Mobile": self.fp["sec-ch-ua-mobile"],
+                "Sec-Ch-Ua-Model": '""',
+                "Sec-Ch-Ua-Platform": self.fp["sec-ch-ua-platform"],
+                "Sec-Ch-Ua-Platform-Version": '"19.0.0"',
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+                "OAI-Device-Id": self.device_id,
+                "OAI-Session-Id": self.session_id,
+                "OAI-Language": "zh-CN",
+                "OAI-Client-Version": self.client_version,
+                "OAI-Client-Build-Number": self.client_build_number,
+            }
         except Exception:
+            if self._session_lease is not None:
+                self._session_lease.release()
             if bool(getattr(self.proxy_profile, "image_egress_reserved", False)):
                 proxy_settings.release_image_egress(self.proxy_profile)
             raise
-        self.session.headers.update({
-            "User-Agent": self.user_agent,
-            "Origin": self.base_url,
-            "Referer": self.base_url + "/",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-            "Priority": "u=1, i",
-            "Sec-Ch-Ua": self.fp["sec-ch-ua"],
-            "Sec-Ch-Ua-Arch": '"x86"',
-            "Sec-Ch-Ua-Bitness": '"64"',
-            "Sec-Ch-Ua-Full-Version": '"143.0.3650.96"',
-            "Sec-Ch-Ua-Full-Version-List": '"Microsoft Edge";v="143.0.3650.96", "Chromium";v="143.0.7499.147", "Not A(Brand";v="24.0.0.0"',
-            "Sec-Ch-Ua-Mobile": self.fp["sec-ch-ua-mobile"],
-            "Sec-Ch-Ua-Model": '""',
-            "Sec-Ch-Ua-Platform": self.fp["sec-ch-ua-platform"],
-            "Sec-Ch-Ua-Platform-Version": '"19.0.0"',
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-            "OAI-Device-Id": self.device_id,
-            "OAI-Session-Id": self.session_id,
-            "OAI-Language": "zh-CN",
-            "OAI-Client-Version": self.client_version,
-            "OAI-Client-Build-Number": self.client_build_number,
-        })
+
+    def _session_owner_key(self) -> str:
+        management_id = str(self.account.get("management_id") or "").strip()
+        if management_id:
+            return f"account:{management_id}"
+        token = str(self.access_token or "").strip()
+        if token:
+            digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+            return f"account-token:{digest}"
+        return "anonymous"
+
     def close(self) -> None:
         if getattr(self, "_closed", False):
             return
         self._closed = True
+        lease = getattr(self, "_session_lease", None)
+        if lease is not None:
+            try:
+                lease.release()
+            except Exception:
+                pass
+            return
         session = getattr(self, "session", None)
         if session:
             try:
@@ -335,7 +359,7 @@ class OpenAIBackendAPI:
 
     def _headers(self, path: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         """构造请求头，并补上 web 端要求的 target path/route。"""
-        headers = dict(self.session.headers)
+        headers = dict(self._base_headers)
         if self.access_token:
             headers["Authorization"] = f"Bearer {self.access_token}"
         headers["X-OpenAI-Target-Path"] = path
@@ -632,9 +656,9 @@ class OpenAIBackendAPI:
             "User-Agent": self.user_agent,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Sec-Ch-Ua": self.session.headers["Sec-Ch-Ua"],
-            "Sec-Ch-Ua-Mobile": self.session.headers["Sec-Ch-Ua-Mobile"],
-            "Sec-Ch-Ua-Platform": self.session.headers["Sec-Ch-Ua-Platform"],
+            "Sec-Ch-Ua": self._base_headers["Sec-Ch-Ua"],
+            "Sec-Ch-Ua-Mobile": self._base_headers["Sec-Ch-Ua-Mobile"],
+            "Sec-Ch-Ua-Platform": self._base_headers["Sec-Ch-Ua-Platform"],
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": "none",
@@ -1556,8 +1580,8 @@ class OpenAIBackendAPI:
             raise RuntimeError("access_token is required for editable file export")
         self.client_version = EDITABLE_FILE_CLIENT_VERSION
         self.client_build_number = EDITABLE_FILE_CLIENT_BUILD_NUMBER
-        self.session.headers["OAI-Client-Version"] = EDITABLE_FILE_CLIENT_VERSION
-        self.session.headers["OAI-Client-Build-Number"] = EDITABLE_FILE_CLIENT_BUILD_NUMBER
+        self._base_headers["OAI-Client-Version"] = EDITABLE_FILE_CLIENT_VERSION
+        self._base_headers["OAI-Client-Build-Number"] = EDITABLE_FILE_CLIENT_BUILD_NUMBER
         output_path = Path(output_dir).expanduser().resolve()
         output_path.mkdir(parents=True, exist_ok=True)
         deadline = time.monotonic() + max(0.001, float(timeout_secs))

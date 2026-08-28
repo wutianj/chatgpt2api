@@ -422,13 +422,18 @@ const selectedRatio = computed(() => selectedPreset.value?.ratio || 'auto')
 const selectedResolution = computed(() => selectedPreset.value?.resolution || 'auto')
 const ratioOptions = computed(() => {
   const seen = new Set<string>()
+  const resolution = selectedResolution.value === 'auto' ? '1K' : selectedResolution.value
   return sizePresets.value
+    .filter((preset) => preset.resolution === resolution)
     .filter((preset) => {
       if (seen.has(preset.ratio)) return false
       seen.add(preset.ratio)
       return true
     })
-    .map((preset) => ({ label: preset.ratio === 'auto' ? '自动' : preset.ratio, value: preset.ratio }))
+    .map((preset) => ({
+      label: preset.ratio === 'auto' ? '自动' : `${preset.ratio} · ${preset.width}x${preset.height}`,
+      value: preset.ratio,
+    }))
 })
 const resolutionOptions = computed(() => {
   const order: ImageSizeResolution[] = ['auto', '1K', '2K', '4K']

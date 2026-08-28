@@ -28,6 +28,7 @@ class PlanView(_StrictModel):
     price_units: int
     credits_units: int
     validity_days: int
+    enabled: bool = True
 
 
 class PlanListView(_StrictModel):
@@ -37,6 +38,10 @@ class PlanListView(_StrictModel):
 class PricingView(_StrictModel):
     chat_cost_units: int
     image_cost_units: int
+    image_1k_cost_units: int
+    image_2k_cost_units: int
+    image_4k_cost_units: int
+    image_4k_enabled: bool
     search_cost_units: int
     file_cost_units: int
 

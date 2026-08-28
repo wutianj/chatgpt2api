@@ -32,6 +32,13 @@
               selected-indicator="none"
               aria-label="账号组筛选"
             />
+            <GroupedSelectMenu
+              v-model="quotaFilter"
+              :options="quotaFilterOptions"
+              placeholder="额度筛选"
+              selected-indicator="none"
+              aria-label="图片额度筛选"
+            />
           </FilterToolbar>
 
           <div class="accounts-toolbar-view">
@@ -710,6 +717,35 @@
                   </StateBlock>
                 </div>
 
+                <div
+                  v-else-if="importMode === 'reg2_jsonl'"
+                  class="space-y-3 account-file-import-panel"
+                  :class="{ 'account-file-import-panel--active': accountFileDragActive }"
+                  @dragenter.prevent="handleAccountFileDragEnter"
+                  @dragover.prevent="handleAccountFileDragEnter"
+                  @dragleave.prevent="handleAccountFileDragLeave"
+                  @drop.prevent="handleAccountFileDrop"
+                >
+                  <ImportModePanel
+                    title="导入 reg2 注册机账号"
+                    description="读取注册机导出的 JSONL/JSON，保存邮箱、密码、2FA、AT/RT 与账号信息，导入后同步账号与额度。"
+                  />
+                  <StateBlock dashed compact>
+                    <label
+                      class="account-file-dropzone"
+                      :class="{ 'account-file-dropzone--active': accountFileDragActive }"
+                      @dragenter.prevent.stop="handleAccountFileDragEnter"
+                      @dragover.prevent.stop="handleAccountFileDragEnter"
+                      @dragleave.prevent.stop="handleAccountFileDragLeave"
+                      @drop.prevent.stop="handleAccountFileDrop"
+                    >
+                      <input type="file" multiple class="hidden" :disabled="importBusy" @change="handleAccountFileChange" />
+                      <span class="account-file-dropzone__button">选择 reg2 JSONL / JSON 文件</span>
+                      <span class="account-file-dropzone__hint">也可以拖入 .jsonl / .json 文件</span>
+                    </label>
+                  </StateBlock>
+                </div>
+
                 <div v-else-if="importMode === 'cpa_json' || importMode === 'sub2api_json'" class="space-y-3">
                   <ImportModePanel
                     :title="importMode === 'sub2api_json' ? '导入 Sub2API JSON 文件' : '导入 CPA JSON 文件'"
@@ -764,7 +800,7 @@
     />
 
     <input ref="manualTokenFileInputRef" type="file" accept=".txt,text/plain" class="hidden" @change="handleManualTokenFileChange" />
-    <input ref="accountFileInputRef" type="file" accept=".json,application/json" multiple class="hidden" @change="handleAccountFileChange" />
+    <input ref="accountFileInputRef" type="file" accept=".json,.jsonl,application/json,application/x-ndjson,text/plain" multiple class="hidden" @change="handleAccountFileChange" />
   </div>
 </template>
 
@@ -823,6 +859,8 @@ const {
   keyword,
   statusFilter,
   groupFilter,
+  quotaFilter,
+  quotaFilterOptions,
   statusFilterOptions,
   groupFilterOptions,
   editingId,
@@ -954,6 +992,7 @@ watch(
 
 const manualTokenFileInputRef = ref<HTMLInputElement | null>(null)
 const accountFileInputRef = ref<HTMLInputElement | null>(null)
+const accountFileDragActive = ref(false)
 const remoteImportBusy = ref(false)
 const accountToolbarMenuClass = 'shrink-0 whitespace-nowrap'
 const accountToolbarButtonClass = 'shrink-0 whitespace-nowrap justify-between gap-2'
@@ -1031,6 +1070,24 @@ async function handleAccountFileChange(event: Event) {
   if (target) target.value = ''
 }
 
+function handleAccountFileDragEnter() {
+  if (importBusy.value) return
+  accountFileDragActive.value = true
+}
+
+function handleAccountFileDragLeave(event: DragEvent) {
+  const current = event.currentTarget as HTMLElement | null
+  const related = event.relatedTarget as Node | null
+  if (current && related && current.contains(related)) return
+  accountFileDragActive.value = false
+}
+
+async function handleAccountFileDrop(event: DragEvent) {
+  accountFileDragActive.value = false
+  if (importBusy.value) return
+  await importLocalAccountFiles(event.dataTransfer?.files)
+}
+
 </script>
 
 <style scoped>
@@ -1044,6 +1101,64 @@ async function handleAccountFileChange(event: Event) {
   max-height: min(36rem, 60dvh);
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
+}
+
+.account-file-import-panel {
+  border-radius: 8px;
+  transition:
+    background-color 0.16s ease,
+    outline-color 0.16s ease;
+}
+
+.account-file-import-panel--active {
+  background: rgba(20, 184, 166, 0.06);
+  outline: 1px solid rgba(20, 184, 166, 0.28);
+  outline-offset: 6px;
+}
+
+.account-file-dropzone {
+  display: flex;
+  min-height: 80px;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 8px;
+  border-radius: 8px;
+  text-align: center;
+  transition:
+    border-color 0.16s ease,
+    background-color 0.16s ease;
+  cursor: pointer;
+}
+
+.account-file-dropzone--active {
+  border-color: rgba(15, 118, 110, 0.65);
+  background: rgba(20, 184, 166, 0.08);
+}
+
+.account-file-dropzone__hint {
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+}
+
+.account-file-dropzone__button {
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid hsl(var(--border));
+  border-radius: 999px;
+  background: hsl(var(--background));
+  padding: 0 14px;
+  color: hsl(var(--foreground));
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1;
+}
+
+.account-file-dropzone:hover .account-file-dropzone__button {
+  border-color: hsl(var(--primary) / 0.45);
+  color: hsl(var(--primary));
 }
 
 @media (min-width: 1024px) {

@@ -59,21 +59,6 @@ export const useAuthStore = defineStore('auth', () => {
     homeRoute.value = '/login'
   }
 
-  async function loginAdmin(password: string) {
-    isLoading.value = true
-    try {
-      const status = await authApi.loginAdmin({ password })
-      const authenticated = applyStatus(status)
-      lastCheckedAt.value = Date.now()
-      return authenticated
-    } catch (error) {
-      clearIdentity()
-      throw error
-    } finally {
-      isLoading.value = false
-    }
-  }
-
   async function loginUser(email: string, password: string) {
     isLoading.value = true
     try {
@@ -152,7 +137,6 @@ export const useAuthStore = defineStore('auth', () => {
     name,
     isAdmin,
     hasCapability,
-    loginAdmin,
     loginUser,
     register,
     logout,

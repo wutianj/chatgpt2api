@@ -55,6 +55,7 @@ class ImageTaskRow(BaseModel):
     elapsed_ms: int | None = Field(default=None, ge=0)
     error_code: str
     public_error: str
+    notice: str = ""
     results: list[ImageTaskAsset] = Field(default_factory=list)
     actions: ImageTaskActions
 

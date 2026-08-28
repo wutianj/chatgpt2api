@@ -7,6 +7,7 @@ export type AccountBackendStatus = '正常' | '限流' | '异常' | '禁用'
 export type AccountStatusCategory = 'normal' | 'limited' | 'abnormal' | 'disabled'
 export type AccountEnabledAction = 'enable' | 'disable'
 export type AccountQuotaState = 'unlimited' | 'unknown' | 'exhausted' | 'available'
+export type AccountQuotaFilter = 'all' | AccountQuotaState
 export type AccountProxyMode = 'inherit' | 'direct' | 'group' | 'custom'
 export type AccountAccessTokenStatus = 'valid' | 'expiring' | 'invalid'
 export type AccountRefreshTokenStatus = 'valid' | 'missing' | 'invalid'
@@ -175,6 +176,11 @@ export interface AccountMutationResponse {
   group_id?: string
   groups?: AccountGroup[]
   proxy_groups?: ProxyGroup[]
+  requested?: number
+  accepted?: number
+  invalid?: number
+  missing_access_token?: number
+  missing_password?: number
 }
 
 export interface AccountExportResult {
@@ -252,6 +258,7 @@ export type AccountListParams = {
   keyword?: string
   status?: 'all' | AccountStatusCategory
   group_id?: string
+  quota_state?: AccountQuotaFilter
 }
 
 export type AccountSelectionScope = {
@@ -261,6 +268,7 @@ export type AccountSelectionScope = {
   keyword?: string
   status?: 'all' | AccountStatusCategory
   group_id?: string
+  quota_state?: AccountQuotaFilter
 }
 
 export type AccountSelectionTarget = readonly string[] | AccountSelectionScope
@@ -716,6 +724,41 @@ export const accountsApi = {
       errors: mutationErrorTexts(response.errors),
       events: response.events || [],
       progress: mutationProgress(response, Math.max(0, Number(response.updated || 0) + Number(response.removed || 0))),
+    }
+  },
+
+  importReg2Accounts: async (
+    records: unknown[],
+    options: AccountImportOptions = {},
+  ) => {
+    const response = await apiClient.post<
+      {
+        records: unknown[]
+        sync_after_import: boolean
+        return_items: boolean
+        target_group_id: string | null
+      },
+      AccountMutationResponse
+    >('/api/accounts/import/reg2', {
+      records,
+      sync_after_import: options.syncAfterImport ?? true,
+      return_items: options.returnItems ?? false,
+      target_group_id: options.targetGroupId ?? null,
+    })
+    return {
+      status: 'ok',
+      added: Number(response.added || 0),
+      skipped: Number(response.skipped || 0),
+      synced: Number(response.synced || 0),
+      updated_ids: response.updated_ids || [],
+      removed_ids: response.removed_ids || [],
+      errors: mutationErrorTexts(response.errors),
+      events: response.events || [],
+      requested: Number(response.requested || 0),
+      accepted: Number(response.accepted || 0),
+      invalid: Number(response.invalid || 0),
+      missing_access_token: Number(response.missing_access_token || 0),
+      missing_password: Number(response.missing_password || 0),
     }
   },
 

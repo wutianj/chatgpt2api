@@ -19,7 +19,7 @@ from services.editable_file_task_service import (
     editable_file_task_service,
 )
 from services.log_service import LoggedCall
-from services.portal_billing import portal_billing
+from services.portal_billing import UnsupportedImageResolutionError, portal_billing
 from services.portal_file_tasks import (
     file_task_reference,
     portal_file_task_id,
@@ -220,11 +220,13 @@ async def _settle_call_result(
     return result
 
 
-async def _reserve_call(call: LoggedCall, *, count: int = 1) -> int:
-    if not portal_billing.user_id(call.identity):
-        return 0
-    amount = portal_billing.cost_for_endpoint(call.endpoint, count=count)
+async def _reserve_call(call: LoggedCall, *, count: int = 1, size: object = None) -> int:
     try:
+        amount = (
+            portal_billing.cost_for_task("image", count=count, size=size)
+            if call.image_request
+            else portal_billing.cost_for_endpoint(call.endpoint, count=count, size=size)
+        )
         reservation = await run_in_threadpool(
             portal_billing.reserve,
             call.identity,
@@ -246,8 +248,12 @@ async def _reserve_call(call: LoggedCall, *, count: int = 1) -> int:
                     "task_id": str(usage.get("task_id") or f"call_{call.call_id}"),
                 },
             )
+    except UnsupportedImageResolutionError as exc:
+        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
     except ValueError as exc:
         raise HTTPException(status_code=402, detail={"error": str(exc)}) from exc
+    if not portal_billing.user_id(call.identity):
+        return 0
     return amount
 
 
@@ -427,7 +433,7 @@ def create_router() -> APIRouter:
         attach_trace_headers(call, request)
         call.attach_trace_metadata(payload)
         await filter_or_log(call, body.prompt)
-        charged_units = await _reserve_call(call, count=body.n)
+        charged_units = await _reserve_call(call, count=body.n, size=body.size)
         task_id = await _start_billed_user_task(call, body.prompt, "image", charged_units)
         try:
             result = await call.run(openai_v1_image_generations.handle, payload)
@@ -461,7 +467,11 @@ def create_router() -> APIRouter:
         if mask_sources:
             payload["mask"] = await read_image_sources(mask_sources)
         payload["base_url"] = resolve_image_base_url(request)
-        charged_units = await _reserve_call(call, count=int(payload.get("n") or 1))
+        charged_units = await _reserve_call(
+            call,
+            count=int(payload.get("n") or 1),
+            size=payload.get("size"),
+        )
         task_id = await _start_billed_user_task(call, prompt, "image", charged_units)
         try:
             result = await call.run(openai_v1_image_edit.handle, payload)
@@ -492,8 +502,17 @@ def create_router() -> APIRouter:
         attach_trace_headers(call, request)
         call.attach_trace_metadata(payload)
         await filter_or_log(call, request_preview)
-        charged_units = await _reserve_call(call)
-        task_id = await _start_billed_user_task(call, request_preview, "chat", charged_units)
+        charged_units = await _reserve_call(
+            call,
+            count=int(payload.get("n") or 1) if image_chat else 1,
+            size=payload.get("size") if image_chat else None,
+        )
+        task_id = await _start_billed_user_task(
+            call,
+            request_preview,
+            "image" if image_chat else "chat",
+            charged_units,
+        )
         try:
             result = await call.run(openai_v1_chat_complete.handle, payload)
         except Exception:
@@ -526,7 +545,11 @@ def create_router() -> APIRouter:
         attach_trace_headers(call, request)
         call.attach_trace_metadata(payload)
         await filter_or_log(call, request_preview)
-        charged_units = await _reserve_call(call)
+        charged_units = await _reserve_call(
+            call,
+            count=int(payload.get("n") or 1) if image_response else 1,
+            size=payload.get("size") if image_response else None,
+        )
         task_id = await _start_billed_user_task(call, request_preview, "image" if image_response else "chat", charged_units)
         try:
             result = await call.run(openai_v1_response.handle, payload)

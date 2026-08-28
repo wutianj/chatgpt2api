@@ -15,6 +15,9 @@ from services.application_database import DatabaseBase, initialize_application_d
 from services.storage.user_repository import UserApiKeyModel, UserModel
 
 
+CUSTOM_REDEEM_PLAN_ID = "custom"
+
+
 class UserWalletModel(DatabaseBase):
     __tablename__ = "user_wallets"
 
@@ -82,6 +85,13 @@ class RedeemCodeModel(DatabaseBase):
     claimed_at = Column(DateTime(timezone=True), nullable=True)
     expires_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class RedeemCodeCreditModel(DatabaseBase):
+    __tablename__ = "redeem_code_credits"
+
+    redeem_code_id = Column(String(64), ForeignKey("redeem_codes.id"), primary_key=True)
+    credits_units = Column(Integer, nullable=False)
 
 
 class UserTaskModel(DatabaseBase):
@@ -172,14 +182,15 @@ class PortalRepository:
 
     def ensure_default_plans(self) -> None:
         defaults = (
-            ("starter", "入门额度", 990, 1000),
-            ("creator", "创作者额度", 2990, 3500),
-            ("pro", "专业额度", 6990, 10000),
+            ("starter", "入门额度", 990, 1000, True),
+            ("creator", "创作者额度", 2990, 3500, True),
+            ("pro", "专业额度", 6990, 10000, True),
+            (CUSTOM_REDEEM_PLAN_ID, "自定义点数", 1, 1, False),
         )
         with self.Session() as session:
             existing = {row.id for row in session.scalars(select(PlanModel)).all()}
             now = _utc_now()
-            for plan_id, name, price, credits in defaults:
+            for plan_id, name, price, credits, enabled in defaults:
                 if plan_id not in existing:
                     session.add(PlanModel(
                         id=plan_id,
@@ -187,7 +198,7 @@ class PortalRepository:
                         price_units=price,
                         credits_units=credits,
                         validity_days=0,
-                        enabled=True,
+                        enabled=enabled,
                         created_at=now,
                     ))
             session.commit()
@@ -924,12 +935,56 @@ class PortalRepository:
                 session.rollback()
                 raise
 
-    def list_plans(self) -> list[dict[str, Any]]:
+    def list_plans(self, *, include_disabled: bool = False) -> list[dict[str, Any]]:
         self.ensure_default_plans()
         with self.Session() as session:
-            return [self._plan_dict(row) for row in session.scalars(
-                select(PlanModel).where(PlanModel.enabled.is_(True)).order_by(PlanModel.price_units)
-            ).all()]
+            query = select(PlanModel)
+            if not include_disabled:
+                query = query.where(PlanModel.enabled.is_(True))
+            return [self._plan_dict(row) for row in session.scalars(query.order_by(PlanModel.price_units)).all()]
+
+    def upsert_plan(
+        self,
+        *,
+        plan_id: str,
+        name: str,
+        price_units: int,
+        credits_units: int,
+        validity_days: int = 0,
+        enabled: bool = True,
+    ) -> dict[str, Any]:
+        normalized_id = plan_id.strip().lower()
+        normalized_name = name.strip()
+        if normalized_id == CUSTOM_REDEEM_PLAN_ID:
+            raise ValueError("自定义点数是系统兑换码类型，不能作为套餐编辑")
+        if not normalized_id or len(normalized_id) > 64:
+            raise ValueError("套餐 ID 无效")
+        if not normalized_name or len(normalized_name) > 120:
+            raise ValueError("套餐名称无效")
+        if price_units <= 0 or credits_units <= 0 or validity_days < 0:
+            raise ValueError("套餐价格、额度必须大于 0，有效期不能为负数")
+        with self.Session() as session:
+            row = session.get(PlanModel, normalized_id)
+            now = _utc_now()
+            if row is None:
+                row = PlanModel(
+                    id=normalized_id,
+                    name=normalized_name,
+                    price_units=price_units,
+                    credits_units=credits_units,
+                    validity_days=validity_days,
+                    enabled=enabled,
+                    created_at=now,
+                )
+                session.add(row)
+            else:
+                row.name = normalized_name
+                row.price_units = price_units
+                row.credits_units = credits_units
+                row.validity_days = validity_days
+                row.enabled = enabled
+            session.commit()
+            return self._plan_dict(row)
 
     def create_redeem_code(
         self,
@@ -937,10 +992,18 @@ class PortalRepository:
         plan_id: str,
         raw_code: str,
         expires_at: datetime | None = None,
+        credits_units: int | None = None,
     ) -> dict[str, Any]:
         normalized = raw_code.strip().upper()
         if len(normalized) < 4:
             raise ValueError("兑换码至少需要 4 位")
+        normalized_credits: int | None = None
+        if credits_units is not None:
+            normalized_credits = int(credits_units)
+            if normalized_credits <= 0 or normalized_credits > 1_000_000_000:
+                raise ValueError("自定义点数必须在 1 到 1,000,000,000 之间")
+            plan_id = CUSTOM_REDEEM_PLAN_ID
+        self.ensure_default_plans()
         with self.Session() as session:
             if session.get(PlanModel, plan_id) is None:
                 raise ValueError("套餐不存在")
@@ -953,12 +1016,24 @@ class PortalRepository:
                 created_at=_utc_now(),
             )
             session.add(row)
+            session.flush()
+            if normalized_credits is not None:
+                session.add(RedeemCodeCreditModel(
+                    redeem_code_id=row.id,
+                    credits_units=normalized_credits,
+                ))
             try:
                 session.commit()
             except IntegrityError as exc:
                 session.rollback()
                 raise ValueError("兑换码已经存在") from exc
-            return {"id": row.id, "plan_id": row.plan_id, "status": row.status, "expires_at": _iso(row.expires_at)}
+            return {
+                "id": row.id,
+                "plan_id": row.plan_id,
+                "credits_units": normalized_credits,
+                "status": row.status,
+                "expires_at": _iso(row.expires_at),
+            }
 
     def redeem(self, *, user_id: str, code: str) -> dict[str, Any]:
         normalized = code.strip().upper()
@@ -974,8 +1049,10 @@ class PortalRepository:
                 session.commit()
                 raise ValueError("兑换码已经过期")
             plan = session.get(PlanModel, row.plan_id)
-            if plan is None or not bool(plan.enabled):
+            if plan is None or (not bool(plan.enabled) and plan.id != CUSTOM_REDEEM_PLAN_ID):
                 raise ValueError("兑换套餐不可用")
+            override = session.get(RedeemCodeCreditModel, row.id)
+            credits_units = int(override.credits_units) if override is not None else int(plan.credits_units)
             claim = session.execute(
                 update(RedeemCodeModel)
                 .where(
@@ -996,14 +1073,14 @@ class PortalRepository:
                 wallet = UserWalletModel(user_id=user_id, balance_units=0, created_at=now, updated_at=now)
                 session.add(wallet)
                 session.flush()
-            wallet.balance_units += plan.credits_units
+            wallet.balance_units += credits_units
             wallet.updated_at = now
             session.refresh(row)
             ledger = WalletLedgerModel(
                 id=f"ledger_{uuid4().hex}",
                 user_id=user_id,
                 entry_type="redeem",
-                amount_units=plan.credits_units,
+                amount_units=credits_units,
                 balance_after=wallet.balance_units,
                 reference_type="redeem_code",
                 reference_id=row.id,
@@ -1018,10 +1095,12 @@ class PortalRepository:
                 action="redeem_claimed",
                 target_type="redeem_code",
                 target_id=row.id,
-                metadata={"plan_id": plan.id, "credits_units": int(plan.credits_units)},
+                metadata={"plan_id": plan.id, "credits_units": credits_units},
             )
             session.commit()
-            return {"plan": self._plan_dict(plan), "balance_units": int(wallet.balance_units)}
+            plan_view = self._plan_dict(plan)
+            plan_view["credits_units"] = credits_units
+            return {"plan": plan_view, "balance_units": int(wallet.balance_units)}
 
     def disable_redeem_code(self, *, code: str, actor_id: str = "admin") -> dict[str, Any]:
         normalized = code.strip().upper()
@@ -1148,6 +1227,7 @@ class PortalRepository:
             "price_units": int(row.price_units),
             "credits_units": int(row.credits_units),
             "validity_days": int(row.validity_days),
+            "enabled": bool(row.enabled),
         }
 
     @staticmethod

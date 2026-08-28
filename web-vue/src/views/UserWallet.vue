@@ -68,7 +68,8 @@
       <div v-if="pricing" class="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <div v-for="item in pricingItems" :key="item.label" class="border border-border p-4">
           <p class="text-xs text-muted-foreground">{{ item.label }}</p>
-          <p class="mt-2 text-lg font-semibold text-foreground">{{ formatCredits(item.cost) }} / 次</p>
+          <p v-if="item.available" class="mt-2 text-lg font-semibold text-foreground">{{ formatCredits(item.cost) }} / 次</p>
+          <p v-else class="mt-2 text-lg font-semibold text-muted-foreground">暂不支持</p>
         </div>
       </div>
       <StateBlock v-else compact dashed title="计费规则加载中" />
@@ -116,10 +117,12 @@ const creatingOrderId = ref('')
 const loadingOrders = ref(false)
 
 const pricingItems = computed(() => pricing.value ? [
-  { label: '对话', cost: pricing.value.chat_cost_units },
-  { label: '生图', cost: pricing.value.image_cost_units },
-  { label: '搜索', cost: pricing.value.search_cost_units },
-  { label: '文件任务', cost: pricing.value.file_cost_units },
+  { label: '对话', cost: pricing.value.chat_cost_units, available: true },
+  { label: '生图 1K', cost: pricing.value.image_1k_cost_units, available: true },
+  { label: '生图 2K', cost: pricing.value.image_2k_cost_units, available: true },
+  { label: '生图 4K', cost: pricing.value.image_4k_cost_units, available: pricing.value.image_4k_enabled },
+  { label: '搜索', cost: pricing.value.search_cost_units, available: true },
+  { label: '文件任务', cost: pricing.value.file_cost_units, available: true },
 ] : [])
 
 function idempotencyKey(planId: string) {

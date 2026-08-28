@@ -28,7 +28,7 @@ name: chatgpt2api-search
 description: Use when current web search is needed through this chatgpt2api server. Call the configured HTTP search endpoint with a prompt and return the answer with source URLs.
 ---
 
-# ChatGPT2API Search
+# I7生图 Search
 
 Use this skill when the user asks for current web search, online lookup, recent information, or source-backed answers.
 
@@ -70,7 +70,7 @@ name: chatgpt2api-search
 description: 当用户需要联网搜索、查询最新信息、核实事实或需要来源链接时，调用本地 chatgpt2api 搜索接口。
 ---
 
-# ChatGPT2API 搜索
+# I7生图搜索
 
 当用户要求联网搜索、查询最新信息、核实资料、查新闻、查价格、查文档更新或需要来源链接时，使用这个 skill。
 

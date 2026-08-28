@@ -1,5 +1,7 @@
 import apiClient from './client'
-import type { Order, Plan } from './billing'
+import type { Order, Plan, Pricing } from './billing'
+
+export type PricingUpdate = Omit<Pricing, 'image_cost_units'>
 
 export interface AdminUser {
   id: string
@@ -30,7 +32,11 @@ export const adminPortalApi = {
   creditUser: (userId: string, amountUnits: number, note: string) => apiClient.post<{ amount_units: number; note: string }, AdminUser>(`/api/admin/users/${encodeURIComponent(userId)}/credit`, { amount_units: amountUnits, note }),
   setUserEnabled: (userId: string, enabled: boolean) => apiClient.post<{ enabled: boolean }, AdminUser>(`/api/admin/users/${encodeURIComponent(userId)}/enabled`, { enabled }),
   plans: () => apiClient.get<never, { items: Plan[] }>('/api/plans'),
-  createRedeemCodes: (planId: string, count: number) => apiClient.post<{ plan_id: string; count: number }, { plan_id: string; codes: string[] }>('/api/admin/redeem-codes', { plan_id: planId, count }),
+  adminPlans: () => apiClient.get<never, { items: Plan[] }>('/api/admin/plans'),
+  updatePlan: (plan: Plan) => apiClient.put<Plan, Plan>(`/api/admin/plans/${encodeURIComponent(plan.id)}`, plan),
+  pricing: () => apiClient.get<never, Pricing>('/api/admin/pricing'),
+  updatePricing: (pricing: PricingUpdate) => apiClient.put<PricingUpdate, Pricing>('/api/admin/pricing', pricing),
+  createRedeemCodes: (planId: string, count: number, creditsUnits?: number) => apiClient.post<{ plan_id: string; count: number; credits_units?: number }, { plan_id: string; codes: string[] }>('/api/admin/redeem-codes', { plan_id: planId, count, ...(creditsUnits === undefined ? {} : { credits_units: creditsUnits }) }),
   disableRedeemCode: (code: string) => apiClient.post<{ code: string }, { id: string; status: string }>('/api/admin/redeem-codes/disable', { code }),
   orders: (status?: string, keyword = '') => apiClient.get<never, { items: Order[] }>('/api/admin/orders', { params: { status: status || undefined, keyword: keyword || undefined } }),
   updateOrderStatus: (orderId: string, status: 'paid' | 'failed' | 'refunded') => apiClient.post<{ status: string }, Order>(`/api/admin/orders/${encodeURIComponent(orderId)}/status`, { status }),

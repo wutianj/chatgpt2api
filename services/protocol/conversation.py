@@ -43,6 +43,7 @@ from services.image_upscale_service import upscale_image_if_needed
 from services.openai_backend_api import OpenAIBackendAPI
 from services.proxy_service import ImageEgressDeadlineError, proxy_settings
 from services.realtime_monitor_service import realtime_monitor_service
+from services.portal_billing import UnsupportedImageResolutionError, portal_billing
 from utils.helper import (
     IMAGE_MODELS,
     UpstreamHTTPError,
@@ -54,6 +55,30 @@ from utils.helper import (
 from utils.image_tokens import count_image_content_tokens, image_size_from_bytes
 from utils.log import logger
 from utils.diagnostics import diagnostic_excerpt
+
+
+_IMAGE_PAID_PLAN_TYPES = ("plus", "pro", "prolite", "team")
+_IMAGE_2K_FALLBACK_NOTICE = (
+    "当前没有可用的 Plus/Pro 2K 生图额度，已自动降级到 Free 账号的 1K；"
+    "2K 暂时无额度，如需恢复 2K 请联系管理员修复号池。"
+)
+
+
+def _free_image_size(size: object) -> str:
+    normalized = str(size or "").strip().lower().replace(" ", "")
+    if not normalized or normalized in {"auto", "default", "1k"}:
+        return "1024x1024"
+    match = re.fullmatch(r"(\d+)x(\d+)", normalized)
+    if not match:
+        return "1024x1024"
+    width, height = (int(value) for value in match.groups())
+    max_edge = max(width, height)
+    if max_edge <= 1920:
+        return f"{width}x{height}"
+    scale = 1920 / max_edge
+    reduced_width = max(8, round(width * scale / 8) * 8)
+    reduced_height = max(8, round(height * scale / 8) * 8)
+    return f"{reduced_width}x{reduced_height}"
 
 
 def _monitor_image_stage(request: "ConversationRequest", event: str, **data: Any) -> None:
@@ -542,6 +567,7 @@ class ConversationRequest:
     trace_image_perf: bool = False
     monitor_attempt: int = 0
     deadline_monotonic: float = 0.0
+    resolution_notice: str = ""
 
 
 @dataclass
@@ -575,6 +601,7 @@ class ImageOutput:
     image_attempts: list[dict[str, Any]] = field(default_factory=list)
     account_email: str = ""
     conversation_id: str = ""
+    notice: str = ""
     failure: ImageFailure | None = field(default=None, repr=False)
 
     def to_chunk(self) -> dict[str, Any]:
@@ -596,6 +623,8 @@ class ImageOutput:
             chunk["_image_urls"] = list(self.image_urls)
         if self.image_attempts:
             chunk["_image_attempts"] = [dict(item) for item in self.image_attempts]
+        if self.notice:
+            chunk["notice"] = self.notice
         if self.kind == "message":
             chunk.update({
                 "object": "image.generation.message",
@@ -1635,6 +1664,7 @@ def _image_result_output_from_urls(
         data=data,
         image_urls=list(formatted.get("_image_urls") or []),
         conversation_id=conversation_id,
+        notice=request.resolution_notice,
     )
 
 
@@ -2028,6 +2058,52 @@ def stream_codex_image_outputs(
     )
 
 
+def _select_image_account(
+    request: ConversationRequest,
+    attempted_tokens: set[str],
+    *,
+    premium_fallback_used: bool,
+) -> tuple[str, bool]:
+    plan_type, _ = split_image_model(request.model)
+    codex_model = is_codex_image_model(request.model)
+    requested_resolution = portal_billing.image_resolution_for_size(request.size)
+    requires_paid_2k = (
+        requested_resolution == "2K"
+        and not plan_type
+        and not codex_model
+        and not premium_fallback_used
+    )
+    selection_plan_types = (
+        _IMAGE_PAID_PLAN_TYPES
+        if requires_paid_2k
+        else ("plus", "team", "pro") if codex_model and not plan_type else None
+    )
+    try:
+        token = account_service.get_available_access_token(
+            plan_type=plan_type,
+            source_type="codex" if codex_model else None,
+            plan_types=selection_plan_types,
+            excluded_tokens=attempted_tokens,
+            deadline_monotonic=request.deadline_monotonic or None,
+        )
+    except ImageAccountSelectionError as paid_exc:
+        if not requires_paid_2k or paid_exc.kind not in {"unavailable", "quota_exhausted"}:
+            raise
+        try:
+            token = account_service.get_available_access_token(
+                plan_type="free",
+                source_type=None,
+                excluded_tokens=attempted_tokens,
+                deadline_monotonic=request.deadline_monotonic or None,
+            )
+        except ImageAccountSelectionError:
+            raise paid_exc
+        request.size = _free_image_size(request.size)
+        request.resolution_notice = _IMAGE_2K_FALLBACK_NOTICE
+        return token, True
+    return token, premium_fallback_used
+
+
 def _generate_single_image(
         request: ConversationRequest,
         index: int,
@@ -2043,6 +2119,7 @@ def _generate_single_image(
     attempted_tokens: set[str] = set()
     fallback_retry_pending = False
     fallback_retry_used = False
+    premium_fallback_used = False
     fallback_from_egress: dict[str, Any] = {}
     image_attempts: list[dict[str, Any]] = []
     retry_error: ImageGenerationError | None = None
@@ -2063,6 +2140,8 @@ def _generate_single_image(
         attempts = [dict(item) for item in image_attempts]
         for output in outputs:
             output.image_attempts = attempts
+            if request.resolution_notice and not output.notice:
+                output.notice = request.resolution_notice
 
     def retry_with_different_account(
         failure: ImageFailure,
@@ -2108,14 +2187,10 @@ def _generate_single_image(
                     index=index,
                     total=total,
                 )
-                plan_type, _ = split_image_model(request.model)
-                codex_model = is_codex_image_model(request.model)
-                token = account_service.get_available_access_token(
-                    plan_type=plan_type,
-                    source_type="codex" if codex_model else None,
-                    plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
-                    excluded_tokens=attempted_tokens,
-                    deadline_monotonic=request.deadline_monotonic or None,
+                token, premium_fallback_used = _select_image_account(
+                    request,
+                    attempted_tokens,
+                    premium_fallback_used=premium_fallback_used,
                 )
                 attempted_tokens.add(token)
                 account_attempt_started = account_wait_started
@@ -2738,6 +2813,19 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
             "unsupported image model,supported models: " + ", ".join(sorted(IMAGE_MODELS)),
             failure=image_failure("unsupported_model"),
         )
+    try:
+        portal_billing.image_cost_for_size(request.size, count=request.n)
+    except UnsupportedImageResolutionError as exc:
+        _monitor_image_stage(
+            request,
+            "image_local_rejected",
+            local_reason="unsupported_resolution",
+            status="failed",
+        )
+        raise ImageGenerationError(
+            str(exc),
+            failure=image_failure("unsupported_model", raw_detail=str(exc)),
+        ) from exc
 
     if request.deadline_monotonic <= 0:
         request.deadline_monotonic = (
@@ -2894,6 +2982,8 @@ def _image_stream_payload(output: ImageOutput, event_type: str, payload: dict[st
         item["_conversation_id"] = output.conversation_id
     if output.image_attempts:
         item["_image_attempts"] = [dict(attempt) for attempt in output.image_attempts]
+    if output.notice:
+        item["notice"] = output.notice
     return item
 
 
@@ -2943,6 +3033,7 @@ def collect_image_outputs(
     conversation_id = ""
     image_urls: list[str] = []
     image_attempts: list[dict[str, Any]] = []
+    notice = ""
     failed_output: ImageOutput | None = None
     for output in outputs:
         created = created or output.created
@@ -2950,6 +3041,8 @@ def collect_image_outputs(
             account_email = output.account_email
         if output.conversation_id and not conversation_id:
             conversation_id = output.conversation_id
+        if output.notice and not notice:
+            notice = output.notice
         for attempt in output.image_attempts:
             if isinstance(attempt, dict) and attempt not in image_attempts:
                 image_attempts.append(dict(attempt))
@@ -2991,4 +3084,6 @@ def collect_image_outputs(
         result["_image_urls"] = list(dict.fromkeys(image_urls))
     if image_attempts:
         result["_image_attempts"] = image_attempts
+    if notice:
+        result["notice"] = notice
     return result

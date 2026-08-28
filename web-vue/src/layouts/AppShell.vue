@@ -32,7 +32,7 @@
               </svg>
             </div>
             <div class="sidebar-label sidebar-brand-label">
-              <p class="ui-section-title">ChatGPT2API</p>
+              <p class="ui-section-title">I7生图</p>
             </div>
           </div>
         </div>
@@ -1270,7 +1270,7 @@ function applyUpdateTask(task: UpdateTaskResponse, open: boolean) {
   updateTargetTag.value = normalizeVersionTag(task.latest_tag || updateTargetTag.value)
   currentVersionTag.value = normalizeVersionTag(task.current_tag || currentVersionTag.value)
   updateProgressState.open = open
-  updateProgressState.title = task.busy ? '正在更新 ChatGPT2API' : 'ChatGPT2API 更新'
+  updateProgressState.title = task.busy ? '正在更新 I7生图' : 'I7生图更新'
   updateProgressState.subtitle = task.latest_tag ? `目标版本 ${normalizeVersionTag(task.latest_tag)}` : ''
   updateProgressState.total = task.total
   updateProgressState.current = task.current

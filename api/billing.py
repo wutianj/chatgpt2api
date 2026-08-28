@@ -51,12 +51,7 @@ def create_router() -> APIRouter:
 
     @router.get("/api/pricing", response_model=PricingView)
     async def pricing():
-        return {
-            "chat_cost_units": portal_billing.chat_cost_units,
-            "image_cost_units": portal_billing.image_cost_units,
-            "search_cost_units": portal_billing.search_cost_units,
-            "file_cost_units": portal_billing.file_cost_units,
-        }
+        return portal_billing.pricing()
 
     @router.post("/api/orders", response_model=OrderView, status_code=status.HTTP_201_CREATED)
     async def create_order(

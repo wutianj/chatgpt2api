@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import hashlib
 import json
 import random
 import re
@@ -25,6 +26,8 @@ FlareSolverrRequestMethod = Callable[[str, bytes, dict[str, str], float], bytes]
 
 DEFAULT_PROXY_NODE_IMAGE_CONCURRENCY_LIMIT = 30
 MAX_PROXY_NODE_IMAGE_CONCURRENCY_LIMIT = 10000
+DEFAULT_UPSTREAM_SESSION_POOL_MAX_ENTRIES = 256
+DEFAULT_UPSTREAM_SESSION_IDLE_TTL = 600.0
 PROXY_NODE_IMAGE_CONCURRENCY_FIELDS = (
     "image_concurrency_limit",
     "image_concurrency",
@@ -165,6 +168,42 @@ class ResolvedProxyReference:
     image_egress_wait_ms: int = 0
 
 
+@dataclass
+class _UpstreamSessionEntry:
+    session: Session
+    last_used: float
+    in_flight: int = 0
+
+
+class UpstreamSessionLease:
+    """Lease a pooled upstream session for one backend operation."""
+
+    def __init__(self, session: Session, release_callback: Callable[[], None]) -> None:
+        self.session = session
+        self._release_callback = release_callback
+        self._released = False
+        self._release_lock = threading.Lock()
+
+    def release(self) -> None:
+        with self._release_lock:
+            if self._released:
+                return
+            self._released = True
+        self._release_callback()
+
+    def __enter__(self) -> "UpstreamSessionLease":
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.release()
+
+    def __del__(self):
+        try:
+            self.release()
+        except Exception:
+            pass
+
+
 class FlareSolverrClearanceProvider:
     def __init__(self, flaresolverr_url: str, request_method: FlareSolverrRequestMethod | None = None) -> None:
         self.flaresolverr_url = str(flaresolverr_url or "").strip().rstrip("/")
@@ -228,6 +267,8 @@ class ProxySettingsStore:
         config_store=None,
         clearance_provider_factory: Callable[[str], FlareSolverrClearanceProvider] | None = None,
         proxy_repository: ProxyConfigurationRepository | None = None,
+        upstream_session_pool_max_entries: int = DEFAULT_UPSTREAM_SESSION_POOL_MAX_ENTRIES,
+        upstream_session_idle_ttl: float = DEFAULT_UPSTREAM_SESSION_IDLE_TTL,
     ) -> None:
         self._config = config_store or config
         self._proxy_repository = (
@@ -241,6 +282,10 @@ class ProxySettingsStore:
         self._egress_inflight: dict[str, int] = {}
         self._lock = threading.RLock()
         self._egress_condition = threading.Condition(self._lock)
+        self._upstream_session_pool: dict[tuple[str, str, str, bool], _UpstreamSessionEntry] = {}
+        self._upstream_session_lock = threading.RLock()
+        self._upstream_session_pool_max_entries = max(1, int(upstream_session_pool_max_entries))
+        self._upstream_session_idle_ttl = max(1.0, float(upstream_session_idle_ttl))
 
     def get_profile(
         self,
@@ -254,6 +299,7 @@ class ProxySettingsStore:
         runtime = self._get_runtime_settings()
         clearance = dict(runtime.get("clearance") if isinstance(runtime.get("clearance"), dict) else {})
         runtime_enabled = bool(runtime.get("enabled"))
+        account_sticky_key = _account_proxy_sticky_key(account)
 
         selected_proxy = ""
         source = "direct"
@@ -273,6 +319,7 @@ class ProxySettingsStore:
                 account_proxy,
                 source="account",
                 terminal_when_unresolved=True,
+                sticky_key=account_sticky_key,
                 reserve_image_egress=reserve_image_egress,
                 deadline_monotonic=deadline_monotonic,
             )
@@ -293,6 +340,7 @@ class ProxySettingsStore:
                     account_group_proxy,
                     source="account_group",
                     terminal_when_unresolved=False,
+                    sticky_key=account_sticky_key,
                     reserve_image_egress=reserve_image_egress,
                     deadline_monotonic=deadline_monotonic,
                 )
@@ -313,6 +361,7 @@ class ProxySettingsStore:
                     explicit_proxy,
                     source="explicit",
                     terminal_when_unresolved=True,
+                    sticky_key=account_sticky_key,
                     reserve_image_egress=reserve_image_egress,
                     deadline_monotonic=deadline_monotonic,
                 )
@@ -333,6 +382,7 @@ class ProxySettingsStore:
                     resource_proxy,
                     source="resource",
                     terminal_when_unresolved=True,
+                    sticky_key=account_sticky_key,
                     reserve_image_egress=reserve_image_egress,
                     deadline_monotonic=deadline_monotonic,
                 )
@@ -353,6 +403,7 @@ class ProxySettingsStore:
                     legacy_proxy,
                     source="default",
                     terminal_when_unresolved=False,
+                    sticky_key=account_sticky_key,
                     reserve_image_egress=reserve_image_egress,
                     deadline_monotonic=deadline_monotonic,
                 )
@@ -443,6 +494,114 @@ class ProxySettingsStore:
         if profile.skip_ssl_verify:
             session_kwargs["verify"] = False
         return session_kwargs
+
+    def acquire_upstream_session(
+        self,
+        profile: ProxyRuntimeProfile,
+        *,
+        owner_key: str,
+        impersonate: str,
+        verify: bool = True,
+        curl_infos: list[object] | tuple[object, ...] = (),
+    ) -> UpstreamSessionLease:
+        """Acquire a persistent session isolated by account, proxy and TLS profile.
+
+        The lease keeps the entry active while a backend uses it. Idle entries are
+        removed on later acquisitions, which bounds memory without closing a
+        session that is still serving a request.
+        """
+        effective_verify = bool(verify) and not bool(profile.skip_ssl_verify)
+        key = (
+            _clean(owner_key) or "anonymous",
+            normalize_proxy_url(profile.proxy_url),
+            _clean(impersonate) or "chrome110",
+            effective_verify,
+        )
+        evicted: list[_UpstreamSessionEntry] = []
+        try:
+            with self._upstream_session_lock:
+                now = time.monotonic()
+                evicted.extend(self._evict_upstream_sessions_locked(now))
+                entry = self._upstream_session_pool.get(key)
+                if entry is None:
+                    session_kwargs = self.build_session_kwargs_from_profile(
+                        profile,
+                        impersonate=key[2],
+                        verify=effective_verify,
+                        curl_infos=list(curl_infos),
+                    )
+                    session = Session(**session_kwargs)
+                    entry = _UpstreamSessionEntry(session=session, last_used=now)
+                    self._upstream_session_pool[key] = entry
+                entry.last_used = now
+                entry.in_flight += 1
+        except Exception:
+            self._close_upstream_sessions(evicted)
+            raise
+
+        self._close_upstream_sessions(evicted)
+        return UpstreamSessionLease(
+            entry.session,
+            lambda: self._release_upstream_session(key, entry),
+        )
+
+    def close_upstream_sessions(self) -> None:
+        """Close all idle and active pooled sessions during process shutdown."""
+        with self._upstream_session_lock:
+            entries = list(self._upstream_session_pool.values())
+            self._upstream_session_pool.clear()
+        self._close_upstream_sessions(entries)
+
+    def get_upstream_session_pool_status(self) -> dict[str, int | float]:
+        with self._upstream_session_lock:
+            return {
+                "entries": len(self._upstream_session_pool),
+                "active_leases": sum(entry.in_flight for entry in self._upstream_session_pool.values()),
+                "max_entries": self._upstream_session_pool_max_entries,
+                "idle_ttl_seconds": self._upstream_session_idle_ttl,
+            }
+
+    def _release_upstream_session(
+        self,
+        key: tuple[str, str, str, bool],
+        entry: _UpstreamSessionEntry,
+    ) -> None:
+        with self._upstream_session_lock:
+            if self._upstream_session_pool.get(key) is not entry:
+                return
+            entry.in_flight = max(0, entry.in_flight - 1)
+            entry.last_used = time.monotonic()
+
+    def _evict_upstream_sessions_locked(self, now: float) -> list[_UpstreamSessionEntry]:
+        evicted: list[_UpstreamSessionEntry] = []
+        for key, entry in list(self._upstream_session_pool.items()):
+            if entry.in_flight == 0 and now - entry.last_used >= self._upstream_session_idle_ttl:
+                self._upstream_session_pool.pop(key, None)
+                evicted.append(entry)
+
+        if len(self._upstream_session_pool) >= self._upstream_session_pool_max_entries:
+            idle_entries = sorted(
+                (
+                    (key, entry)
+                    for key, entry in self._upstream_session_pool.items()
+                    if entry.in_flight == 0
+                ),
+                key=lambda item: item[1].last_used,
+            )
+            for key, entry in idle_entries:
+                if len(self._upstream_session_pool) < self._upstream_session_pool_max_entries:
+                    break
+                self._upstream_session_pool.pop(key, None)
+                evicted.append(entry)
+        return evicted
+
+    @staticmethod
+    def _close_upstream_sessions(entries: list[_UpstreamSessionEntry]) -> None:
+        for entry in entries:
+            try:
+                entry.session.close()
+            except Exception:
+                pass
 
     def build_headers(
         self,
@@ -676,6 +835,7 @@ class ProxySettingsStore:
         *,
         source: str,
         terminal_when_unresolved: bool,
+        sticky_key: str = "",
         reserve_image_egress: bool = False,
         deadline_monotonic: float | None = None,
     ) -> ResolvedProxyReference:
@@ -698,6 +858,7 @@ class ProxySettingsStore:
             group_id = _clean(raw.split(":", 1)[1])
             selection = self._resolve_proxy_group(
                 group_id,
+                sticky_key=sticky_key,
                 reserve_image_egress=reserve_image_egress,
                 deadline_monotonic=deadline_monotonic,
             )
@@ -739,6 +900,7 @@ class ProxySettingsStore:
         self,
         group_id: object,
         *,
+        sticky_key: str = "",
         reserve_image_egress: bool = False,
         deadline_monotonic: float | None = None,
     ) -> ProxyGroupSelection:
@@ -775,7 +937,18 @@ class ProxySettingsStore:
                         if self._proxy_node_has_image_capacity(normalized, node, node_index)
                     ]
                     if available_nodes:
-                        selected_index, selected = random.choice(available_nodes)
+                        if sticky_key:
+                            selected_index, selected = min(
+                                available_nodes,
+                                key=lambda item: _sticky_proxy_node_score(
+                                    sticky_key,
+                                    normalized,
+                                    item[1],
+                                    item[0],
+                                ),
+                            )
+                        else:
+                            selected_index, selected = random.choice(available_nodes)
                         selection = _proxy_group_selection(normalized, selected, selected_index)
                         if reserve_image_egress and selection.image_concurrency_limit > 0:
                             self._egress_inflight[selection.egress_key] = int(
@@ -876,6 +1049,29 @@ class ProxySettingsStore:
 
 def _clean(value: object) -> str:
     return str(value or "").strip()
+
+
+def _account_proxy_sticky_key(account: dict | None) -> str:
+    if not isinstance(account, dict):
+        return ""
+    management_id = _clean(account.get("management_id"))
+    if management_id:
+        return f"account:{management_id}"
+    access_token = _clean(account.get("access_token"))
+    if access_token:
+        digest = hashlib.sha256(access_token.encode("utf-8")).hexdigest()
+        return f"account-token:{digest}"
+    return ""
+
+
+def _sticky_proxy_node_score(
+    sticky_key: str,
+    group_id: str,
+    node: Mapping[str, object],
+    index: int,
+) -> str:
+    node_key = _proxy_node_id(node, index)
+    return hashlib.sha256(f"{sticky_key}\0{group_id}\0{node_key}".encode("utf-8")).hexdigest()
 
 
 def _colon_proxy_to_url(url: str) -> str:

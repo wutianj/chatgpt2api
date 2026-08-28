@@ -786,6 +786,7 @@ class ImageTaskService:
                 status=TASK_STATUS_SUCCESS,
                 data=data,
                 usage=usage,
+                notice=_clean(result.get("notice")),
                 error="",
                 duration_ms=duration_ms,
                 **_clear_task_details(),

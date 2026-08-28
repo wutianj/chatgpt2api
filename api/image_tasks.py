@@ -11,7 +11,7 @@ from api.support import require_identity, resolve_image_base_url
 from services.content_filter import check_request
 from services.image_task_service import ImageTaskQueueFullError, image_task_service
 from services.log_service import LoggedCall
-from services.portal_billing import portal_billing
+from services.portal_billing import UnsupportedImageResolutionError, portal_billing
 from services.storage.portal_repository import portal_repository
 
 
@@ -116,11 +116,19 @@ async def _sync_portal_task(
                 )
 
 
-async def _reserve_image_task(identity: dict[str, object], *, count: int, reference_id: str, endpoint: str, model: str) -> int:
+async def _reserve_image_task(
+    identity: dict[str, object],
+    *,
+    count: int,
+    size: object,
+    reference_id: str,
+    endpoint: str,
+    model: str,
+) -> int:
     if not portal_billing.user_id(identity):
         return 0
-    amount = portal_billing.cost_for_task("image", count=count)
     try:
+        amount = portal_billing.cost_for_task("image", count=count, size=size)
         await run_in_threadpool(
             portal_billing.reserve,
             identity,
@@ -132,6 +140,8 @@ async def _reserve_image_task(identity: dict[str, object], *, count: int, refere
             task_id=reference_id,
             units=count,
         )
+    except UnsupportedImageResolutionError as exc:
+        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
     except ValueError as exc:
         raise HTTPException(status_code=402, detail={"error": str(exc)}) from exc
     return amount
@@ -189,6 +199,7 @@ def create_router() -> APIRouter:
         charged_units = await _reserve_image_task(
             identity,
             count=body.n,
+            size=body.size,
             reference_id=reference_id,
             endpoint="/api/image-tasks/generations",
             model=body.model,
@@ -240,6 +251,7 @@ def create_router() -> APIRouter:
         charged_units = await _reserve_image_task(
             identity,
             count=int(payload.get("n") or 1),
+            size=payload.get("size"),
             reference_id=reference_id,
             endpoint="/api/image-tasks/edits",
             model=model,

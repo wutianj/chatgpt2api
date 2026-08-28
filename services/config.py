@@ -60,6 +60,16 @@ DEFAULT_GENBOX_PUSH = {
     "auto_push_after_studio": False,
 }
 
+DEFAULT_PORTAL_BILLING = {
+    "chat_cost_units": 1,
+    "image_1k_cost_units": 10,
+    "image_2k_cost_units": 20,
+    "image_4k_cost_units": 40,
+    "image_4k_enabled": False,
+    "search_cost_units": 2,
+    "file_cost_units": 20,
+}
+
 DEFAULT_CHAT_COMPLETION_CACHE = {
     "enabled": True,
     "ttl_seconds": 60,
@@ -222,6 +232,16 @@ def _normalize_genbox_push_settings(value: object) -> dict[str, object]:
         "auto_push_after_studio": _normalize_bool(source.get("auto_push_after_studio"), False),
     })
     return normalized
+
+
+def _normalize_portal_billing_settings(value: object) -> dict[str, object]:
+    source = value if isinstance(value, dict) else {}
+    return {
+        key: _normalize_positive_int(source.get(key), int(default), 1)
+        if key != "image_4k_enabled"
+        else _normalize_bool(source.get(key), bool(default))
+        for key, default in DEFAULT_PORTAL_BILLING.items()
+    }
 
 
 def _normalize_chat_completion_cache_settings(value: object) -> dict[str, object]:
@@ -721,6 +741,7 @@ class ConfigStore:
             data["backup"] = self.get_backup_settings()
             data["image_storage"] = self.get_image_storage_settings()
             data["genbox_push"] = self.get_genbox_push_settings()
+            data["portal_billing"] = self.get_portal_billing_settings()
             data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
             data["proxy_runtime"] = self.get_public_proxy_runtime_settings()
             data["fallback_proxy"] = self.get_proxy_fallback_settings()
@@ -808,6 +829,8 @@ class ConfigStore:
             if "genbox_push" in updates:
                 updates["genbox_push"] = _normalize_genbox_push_settings(updates.get("genbox_push"))
                 _validate_genbox_push_settings(updates["genbox_push"])
+            if "portal_billing" in updates:
+                updates["portal_billing"] = _normalize_portal_billing_settings(updates.get("portal_billing"))
             if "chat_completion_cache" in updates:
                 updates["chat_completion_cache"] = _normalize_chat_completion_cache_settings(
                     updates.get("chat_completion_cache")
@@ -838,6 +861,9 @@ class ConfigStore:
 
     def get_genbox_push_settings(self) -> dict[str, object]:
         return _normalize_genbox_push_settings(self.data.get("genbox_push"))
+
+    def get_portal_billing_settings(self) -> dict[str, object]:
+        return _normalize_portal_billing_settings(self.data.get("portal_billing"))
 
     def get_chat_completion_cache_settings(self) -> dict[str, object]:
         return _normalize_chat_completion_cache_settings(self.data.get("chat_completion_cache"))

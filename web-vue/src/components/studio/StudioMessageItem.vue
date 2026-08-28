@@ -190,6 +190,9 @@
                 class="studio-result-block"
                 :class="{ 'studio-result-block-pending': message.pendingSlots.length > 0 }"
               >
+                <p v-if="message.resolutionNotice" class="studio-image-notice">
+                  {{ message.resolutionNotice }}
+                </p>
                 <div class="studio-result-grid" :class="{ 'is-single': message.imageSlotCount <= 1 }">
                   <div
                     v-for="(asset, assetIndex) in message.assets"
@@ -354,6 +357,7 @@ export type StudioMessageView = StudioMessage & {
   failedSlots: number[]
   imagePendingStageText: string
   primaryMessage: string
+  resolutionNotice: string
   imagePreviewStyle?: CSSProperties
   isCollapsible: boolean
   isCollapsed: boolean
@@ -1337,6 +1341,13 @@ async function handleFileTaskDownload(
   display: block;
   width: 100%;
   max-width: 100%;
+}
+
+.studio-image-notice {
+  margin: 0 0 0.65rem;
+  color: rgb(146 64 14);
+  font-size: 0.8125rem;
+  line-height: 1.6;
 }
 
 .studio-result-block-pending {

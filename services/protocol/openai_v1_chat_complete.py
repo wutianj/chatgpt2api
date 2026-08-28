@@ -173,7 +173,7 @@ def chat_messages_from_body(body: dict[str, Any]) -> list[dict[str, Any]]:
     raise HTTPException(status_code=400, detail={"error": "messages or prompt is required"})
 
 
-def chat_image_args(body: dict[str, Any]) -> tuple[str, str, int, list[tuple[bytes, str, str]], str | None]:
+def chat_image_args(body: dict[str, Any]) -> tuple[str, str, int, list[tuple[bytes, str, str]], str | None, object]:
     model = str(body.get("model") or "gpt-image-2").strip() or "gpt-image-2"
     prompt = extract_chat_prompt(body)
     if not prompt:
@@ -183,7 +183,7 @@ def chat_image_args(body: dict[str, Any]) -> tuple[str, str, int, list[tuple[byt
         for idx, (data, mime) in enumerate(extract_chat_image(body), start=1)
     ]
     base_url = str(body.get("base_url") or "").strip() or None
-    return model, prompt, parse_image_count(body.get("n")), images, base_url
+    return model, prompt, parse_image_count(body.get("n")), images, base_url, body.get("size")
 
 
 def text_chat_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
@@ -237,17 +237,21 @@ def stream_web_search_chat_completion(messages: list[dict[str, Any]], model: str
 
 def image_result_content(result: dict[str, Any]) -> str:
     data = result.get("data")
+    notice = str(result.get("notice") or "").strip()
     if isinstance(data, list) and data:
-        return build_chat_image_markdown_content(result)
-    return str(result.get("message") or "Image generation completed.")
+        content = build_chat_image_markdown_content(result)
+        return f"{notice}\n\n{content}" if notice else content
+    content = str(result.get("message") or "Image generation completed.")
+    return f"{notice}\n\n{content}" if notice else content
 
 
 def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
-    model, prompt, n, images, base_url = chat_image_args(body)
+    model, prompt, n, images, base_url, size = chat_image_args(body)
     result = collect_image_outputs(stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
         model=model,
         n=n,
+        size=size,
         response_format="b64_json",
         images=encode_images(images) or None,
         base_url=base_url,
@@ -256,6 +260,8 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
         trace_image_perf=bool(body.get("_trace_image_perf")),
     )))
     response = completion_response(model, image_result_content(result), int(result.get("created") or 0) or None)
+    if result.get("notice"):
+        response["notice"] = result["notice"]
     usage = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),
         input_image_tokens=count_image_inputs_tokens(images, model),
@@ -273,11 +279,12 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
 
 
 def image_chat_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
-    model, prompt, n, images, base_url = chat_image_args(body)
+    model, prompt, n, images, base_url, size = chat_image_args(body)
     image_outputs = stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
         model=model,
         n=n,
+        size=size,
         response_format="b64_json",
         images=encode_images(images) or None,
         base_url=base_url,
@@ -300,22 +307,30 @@ def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: st
             sent_text += content
         elif output.kind == "result":
             content = build_chat_image_markdown_content({"data": output.data})
+            if output.notice:
+                content = f"{output.notice}\n\n{content}"
         elif output.kind == "message":
             content = output.text[len(sent_text):] if output.text.startswith(sent_text) else output.text
         if not content:
             continue
         if not sent_role:
             sent_role = True
+            chunk = completion_chunk(model, {"role": "assistant", "content": content}, None, completion_id, created)
+            if output.notice:
+                chunk["notice"] = output.notice
             yield _with_log_metadata(
-                completion_chunk(model, {"role": "assistant", "content": content}, None, completion_id, created),
+                chunk,
                 output.account_email,
                 output.conversation_id,
                 output.image_urls,
                 output.image_attempts,
             )
         else:
+            chunk = completion_chunk(model, {"content": content}, None, completion_id, created)
+            if output.notice:
+                chunk["notice"] = output.notice
             yield _with_log_metadata(
-                completion_chunk(model, {"content": content}, None, completion_id, created),
+                chunk,
                 output.account_email,
                 output.conversation_id,
                 output.image_urls,

@@ -73,6 +73,7 @@ class AccountSelectionScope(BaseModel):
     keyword: str = ""
     status: str = "all"
     group_id: str = "all"
+    quota_state: Literal["all", "unlimited", "unknown", "exhausted", "available"] = "all"
 
 
 class AccountSelectionPreviewRequest(BaseModel):
@@ -86,6 +87,13 @@ class AccountCreateRequest(BaseModel):
     refresh: bool | None = None
     restore: bool = False
     return_items: bool = True
+    target_group_id: str | None = None
+
+
+class Reg2AccountImportRequest(BaseModel):
+    records: list[Any] = Field(default_factory=list)
+    sync_after_import: bool = True
+    return_items: bool = False
     target_group_id: str | None = None
 
 
@@ -212,6 +220,118 @@ class OAuthLoginFinishRequest(BaseModel):
 
 def _account_payload_token(item: dict[str, Any]) -> str:
     return str(item.get("access_token") or item.get("accessToken") or "").strip()
+
+
+def _reg2_record_token(item: dict[str, Any]) -> str:
+    credentials = item.get("credentials") if isinstance(item.get("credentials"), dict) else {}
+    tokens = item.get("tokens") if isinstance(item.get("tokens"), dict) else {}
+    return _clean_text(
+        item.get("access_token")
+        or item.get("accessToken")
+        or item.get("token")
+        or credentials.get("access_token")
+        or credentials.get("accessToken")
+        or tokens.get("access_token")
+        or tokens.get("accessToken")
+    )
+
+
+def _reg2_credential_text(item: dict[str, Any], *keys: str) -> str:
+    containers = [
+        item.get("credentials") if isinstance(item.get("credentials"), dict) else {},
+        item.get("credential") if isinstance(item.get("credential"), dict) else {},
+        item.get("tokens") if isinstance(item.get("tokens"), dict) else {},
+        item.get("auth") if isinstance(item.get("auth"), dict) else {},
+        item,
+    ]
+    for container in containers:
+        for key in keys:
+            value = _clean_text(container.get(key))
+            if value:
+                return value
+    return ""
+
+
+def _normalize_reg2_import_records(records: list[Any], target_group_id: str | None) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    payloads: list[dict[str, Any]] = []
+    stats = {
+        "requested": len(records),
+        "invalid": 0,
+        "missing_access_token": 0,
+        "missing_password": 0,
+    }
+    for record in records:
+        if not isinstance(record, dict):
+            stats["invalid"] += 1
+            continue
+        access_token = _reg2_record_token(record)
+        if not access_token:
+            stats["missing_access_token"] += 1
+            continue
+        password = _reg2_credential_text(record, "password", "pass")
+        if not password:
+            stats["missing_password"] += 1
+            continue
+        payload: dict[str, Any] = {
+            "access_token": access_token,
+            "password": password,
+            "source_type": "web",
+            "source": "reg2",
+            "status": "正常",
+        }
+        if target_group_id is not None:
+            payload["group_id"] = target_group_id
+        for target, aliases in {
+            "refresh_token": ("refresh_token", "refreshToken"),
+            "id_token": ("id_token", "idToken"),
+            "email": ("email", "account"),
+            "account_id": ("account_id", "accountId", "openai_account_id"),
+            "user_id": ("user_id", "userId"),
+            "type": ("plan_type", "plan", "type"),
+            "totp_secret": ("totp_secret", "totpSecret", "twofa_secret", "otp_secret"),
+            "reg2_group": ("reg2_group", "group"),
+            "batch_id": ("batch_id", "batchId"),
+            "registration_country": ("registration_country", "country"),
+            "session_source": ("session_source", "sessionSource"),
+        }.items():
+            value = _reg2_credential_text(record, *aliases)
+            if value:
+                payload[target] = value
+        payloads.append(payload)
+    return payloads, stats
+
+
+def _ensure_reg2_account_groups(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups = _config_dict_list("account_groups")
+    by_id = {
+        _account_group_id(group.get("id")): dict(group)
+        for group in groups
+        if _account_group_id(group.get("id"))
+    }
+    changed = False
+    for payload in payloads:
+        if _clean_text(payload.get("group_id")):
+            continue
+        group_name = _clean_text(payload.get("reg2_group"))
+        if not group_name:
+            continue
+        group_id = _account_group_id(group_name)
+        if not group_id:
+            continue
+        if group_id not in by_id:
+            by_id[group_id] = {
+                "id": group_id,
+                "name": group_name,
+                "proxy": "",
+                "proxy_group_id": "",
+                "enabled": True,
+                "notes": "reg2 import",
+            }
+            changed = True
+        payload["group_id"] = group_id
+    if changed:
+        config.update({"account_groups": list(by_id.values())})
+    return payloads
 
 
 def _unique_tokens(tokens: list[str]) -> list[str]:
@@ -966,17 +1086,33 @@ def _account_matches_group(account: dict[str, Any], group_id: str) -> bool:
     return current == group_id
 
 
+def _account_quota_state(account: dict[str, Any]) -> str:
+    checker = getattr(account_service, "is_unlimited_image_quota_account", None)
+    if callable(checker) and checker(account):
+        return "unlimited"
+    if bool(account.get("image_quota_unknown")):
+        return "unknown"
+    return "exhausted" if int(account.get("quota") or 0) <= 0 else "available"
+
+
+def _account_matches_quota_state(account: dict[str, Any], quota_state: str) -> bool:
+    normalized = quota_state.strip().lower()
+    return normalized in {"", "all"} or _account_quota_state(account) == normalized
+
+
 def _account_matches_filters(
         account: dict[str, Any],
         *,
         keyword: str,
         status: str,
         group_id: str,
+        quota_state: str,
 ) -> bool:
     return (
         _account_matches_keyword(account, keyword)
         and _status_matches_filter(account, status)
         and _account_matches_group(account, group_id)
+        and _account_matches_quota_state(account, quota_state)
     )
 
 
@@ -986,6 +1122,7 @@ def _filtered_accounts(
         keyword: str,
         status: str,
         group_id: str,
+        quota_state: str,
 ) -> list[dict[str, Any]]:
     return [
         account
@@ -995,6 +1132,7 @@ def _filtered_accounts(
             keyword=keyword,
             status=status,
             group_id=group_id,
+            quota_state=quota_state,
         )
     ]
 
@@ -1009,6 +1147,7 @@ def _account_selection_members(
             keyword=selection.keyword,
             status=selection.status,
             group_id=selection.group_id,
+            quota_state=selection.quota_state,
         )
 
     members: list[tuple[str, str]] = []
@@ -1093,6 +1232,7 @@ def _accounts_page(
         keyword: str,
         status: str,
         group_id: str,
+        quota_state: str,
 ) -> dict[str, Any]:
     items = account_service.list_accounts()
     filtered = _filtered_accounts(
@@ -1100,6 +1240,7 @@ def _accounts_page(
         keyword=keyword,
         status=status,
         group_id=group_id,
+        quota_state=quota_state,
     )
     safe_page = max(1, page)
     safe_page_size = max(1, min(page_size, 500))
@@ -1212,6 +1353,7 @@ def create_router() -> APIRouter:
             keyword: str = "",
             status: str = "all",
             group_id: str = "all",
+            quota_state: str = "all",
             authorization: str | None = Header(default=None),
     ):
         require_admin(authorization)
@@ -1221,6 +1363,7 @@ def create_router() -> APIRouter:
             keyword=keyword,
             status=status,
             group_id=group_id,
+            quota_state=quota_state,
         )
 
     @router.post("/api/accounts/selection-preview")
@@ -1494,6 +1637,87 @@ def create_router() -> APIRouter:
         )
         if body.sync_after_import is None and body.refresh is not None:
             payload["refreshed"] = payload["synced"]
+        return payload
+
+    @router.post("/api/accounts/import/reg2")
+    async def import_reg2_accounts(body: Reg2AccountImportRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        target_group_id = _target_account_group_id(body.target_group_id)
+        account_payloads, import_stats = _normalize_reg2_import_records(body.records, target_group_id)
+        if not account_payloads:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "no valid reg2 accounts found",
+                    **import_stats,
+                },
+            )
+        if target_group_id is None:
+            account_payloads = _ensure_reg2_account_groups(account_payloads)
+        result = await run_in_threadpool(
+            account_service.add_account_items,
+            account_payloads,
+            return_items=False,
+            return_item_results=True,
+        )
+        tokens = _unique_tokens([_account_payload_token(item) for item in account_payloads])
+        targets: list[tuple[str, str]] = []
+        sensitive_values = list(tokens)
+        proxy_values: list[str] = []
+        for token in tokens:
+            account = _get_account_by_token_identity(token)
+            account_id = _clean_text((account or {}).get("management_id"))
+            active_token = _clean_text((account or {}).get("access_token")) or token
+            if account_id:
+                targets.append((active_token, account_id))
+            for key in ("refresh_token", "id_token"):
+                value = _clean_text((account or {}).get(key))
+                if value:
+                    sensitive_values.append(value)
+            proxy = _clean_text((account or {}).get("proxy"))
+            if proxy:
+                proxy_values.append(proxy)
+
+        synced = 0
+        sanitized_errors: list[dict[str, str]] = []
+        if body.sync_after_import and targets:
+            refresh_result = await run_in_threadpool(
+                account_service.sync_accounts_and_quota,
+                _unique_tokens([active_token for active_token, _account_id in targets]),
+            )
+            synced = max(0, int(refresh_result.get("synced") or 0))
+            sanitized_errors = _sanitize_refresh_errors(
+                refresh_result.get("errors"),
+                id_by_token_hint=_refresh_error_id_map(targets),
+                sensitive_values=sensitive_values,
+                proxy_values=proxy_values,
+            )
+
+        updated_ids, removed_ids = _partition_account_ids([account_id for _token, account_id in targets])
+        labels = _account_operation_labels(targets)
+        payload = _account_mutation_response(
+            added=max(0, int(result.get("added") or 0)),
+            skipped=max(0, int(result.get("skipped") or 0)),
+            synced=synced,
+            updated_ids=updated_ids,
+            removed_ids=removed_ids,
+            errors=sanitized_errors,
+            events=_account_mutation_events(
+                action="import_account",
+                success_ids=updated_ids,
+                removed_ids=removed_ids,
+                errors=sanitized_errors,
+                labels=labels,
+                success_message="reg2 账号已保存",
+                removed_message="reg2 账号保存后已被移除",
+            ),
+            include_items=body.return_items,
+        )
+        payload["requested"] = import_stats["requested"]
+        payload["accepted"] = len(account_payloads)
+        payload["invalid"] = import_stats["invalid"]
+        payload["missing_access_token"] = import_stats["missing_access_token"]
+        payload["missing_password"] = import_stats["missing_password"]
         return payload
 
     @router.delete("/api/accounts")

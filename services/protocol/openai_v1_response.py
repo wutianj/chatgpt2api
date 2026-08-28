@@ -410,6 +410,9 @@ def stream_image_response(
                 image_attempts=output.image_attempts,
             )
             completed = response_completed(response_id, model, created, [item], usage)
+            if output.notice:
+                completed["notice"] = output.notice
+                completed["response"]["notice"] = output.notice
             _with_log_metadata(completed, output.account_email, output.conversation_id, image_attempts=output.image_attempts)
             _with_log_metadata(completed["response"], output.account_email, output.conversation_id, image_attempts=output.image_attempts)
             yield completed
@@ -432,6 +435,9 @@ def stream_image_response(
                     output.image_attempts,
                 )
             completed = response_completed(response_id, model, created, items, usage)
+            if output.notice:
+                completed["notice"] = output.notice
+                completed["response"]["notice"] = output.notice
             _with_log_metadata(completed, output.account_email, output.conversation_id, output.image_urls, output.image_attempts)
             _with_log_metadata(completed["response"], output.account_email, output.conversation_id, output.image_urls, output.image_attempts)
             yield completed

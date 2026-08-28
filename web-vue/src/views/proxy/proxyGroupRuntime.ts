@@ -318,6 +318,31 @@ export function useProxyGroupRuntime() {
     }
   }
 
+  async function saveProxyNodeConcurrency(group: ProxyGroup, node: ProxyNode, limit: number) {
+    savingGroupId.value = group.id
+    try {
+      const response = await proxyApi.saveGroup({
+        id: group.id,
+        nodes: group.nodes.map((item, index) => ({
+          id: item.id,
+          name: String(item.name || `出口 ${index + 1}`).trim(),
+          url: String(item.url || '').trim(),
+          enabled: item.enabled !== false,
+          image_concurrency_limit: item.id === node.id
+            ? normalizeImageConcurrencyLimit(limit)
+            : normalizeImageConcurrencyLimit(item.image_concurrency_limit),
+          notes: String(item.notes || '').trim(),
+        })),
+      })
+      upsertGroup(response.group)
+      toast.success(`${node.name || node.id} 图片并发已更新`)
+    } catch (error) {
+      toast.error(prefixedErrorMessage('保存图片并发失败', error))
+    } finally {
+      savingGroupId.value = ''
+    }
+  }
+
   async function toggleProxyGroup(group: ProxyGroup) {
     const nextEnabled = !group.enabled
     const confirmed = await confirmDialog.ask({
@@ -483,6 +508,7 @@ export function useProxyGroupRuntime() {
     removeGroupNode,
     applyNodeImport,
     saveProxyGroup,
+    saveProxyNodeConcurrency,
     handleProxyGroupAction,
     testProxyGroupNode,
     nodeTestSummary,

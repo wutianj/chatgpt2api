@@ -20,6 +20,7 @@ export {
 export const ACCOUNT_IMPORT_MODE_CATALOG = [
   { label: 'OAuth 登录已有账号', value: 'oauth_login' },
   { label: '导入完整备份文件', value: 'backup_json' },
+  { label: '导入 reg2 注册机账号', value: 'reg2_jsonl' },
   { label: '导入 Access Token', value: 'access_token' },
   { label: '导入 Session JSON', value: 'session_json' },
   { label: '导入 CPA JSON 文件', value: 'cpa_json' },
@@ -68,6 +69,37 @@ export function parseAccountArchive(rawText: string, label: string) {
     .filter((item): item is AccountImportPayload => Boolean(item))
   if (!accounts.length) throw new Error(`${label} 中没有找到 access_token`)
   return accounts
+}
+
+export function parseReg2AccountRows(rawText: string, label: string): unknown[] {
+  const text = rawText.trim()
+  if (!text) throw new Error(`${label} 是空文件`)
+  if (text.startsWith('[') || text.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(text)
+      if (Array.isArray(parsed)) return parsed
+      const root = accountRecord(parsed)
+      if (!root) return []
+      if (Array.isArray(root.records)) return root.records
+      if (Array.isArray(root.accounts)) return root.accounts
+      return [root]
+    } catch (error) {
+      if (!text.includes('\n')) throw error
+    }
+  }
+  const rows: unknown[] = []
+  for (const [index, line] of text.split(/\r?\n/).entries()) {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith('#')) continue
+    try {
+      const parsed = JSON.parse(trimmed)
+      rows.push(parsed)
+    } catch (error) {
+      throw new Error(`${label} 第 ${index + 1} 行不是有效 JSON`)
+    }
+  }
+  if (!rows.length) throw new Error(`${label} 中没有找到 reg2 账号记录`)
+  return rows
 }
 
 const ACCOUNT_ARCHIVE_ROW_KEYS = ['accounts', 'items', 'results'] as const
@@ -625,8 +657,27 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
     if (!fileList.length) return
     const restoringBackup = importMode.value === 'backup_json'
     const importingSub2API = importMode.value === 'sub2api_json'
+    const importingReg2 = importMode.value === 'reg2_jsonl'
+    let preloadedReg2Payloads: unknown[] | null = null
+    if (importingReg2) {
+      try {
+        preloadedReg2Payloads = []
+        for (const file of fileList) {
+          preloadedReg2Payloads.push(...parseReg2AccountRows(await file.text(), file.name))
+        }
+      } catch (error) {
+        options.setError('导入 reg2 注册机账号失败', error, false)
+        return
+      }
+      if (!preloadedReg2Payloads.length) {
+        options.setError('导入 reg2 注册机账号失败', new Error('文件中没有找到 reg2 账号记录'), false)
+        return
+      }
+    }
     const title = restoringBackup
       ? '导入完整备份文件'
+      : importingReg2
+        ? '导入 reg2 注册机账号'
       : importingSub2API
         ? '导入 Sub2API JSON 文件'
         : '导入 CPA JSON 文件'
@@ -634,6 +685,8 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
       title,
       message: restoringBackup
         ? `即将读取 ${fileList.length} 个备份文件并恢复其中的账号凭据、配置与状态。是否继续？`
+        : importingReg2
+          ? `已识别 ${preloadedReg2Payloads?.length || 0} 个 reg2 账号记录，导入账号池后同步账号与额度。是否继续？`
         : `即将读取 ${fileList.length} 个 ${importingSub2API ? 'Sub2API' : 'CPA'} JSON 文件，保存账号后同步账号与额度。是否继续？`,
       confirmText: '确认导入',
       cancelText: '取消',
@@ -652,12 +705,23 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
     await nextTick()
     try {
       const accountPayloads: AccountImportPayload[] = []
-      for (const [index, file] of fileList.entries()) {
-        const text = await file.text()
-        accountPayloads.push(...parseAccountArchive(text, file.name))
+      const reg2Payloads: unknown[] = preloadedReg2Payloads ? [...preloadedReg2Payloads] : []
+      if (!importingReg2) {
+        for (const [index, file] of fileList.entries()) {
+          const text = await file.text()
+          accountPayloads.push(...parseAccountArchive(text, file.name))
+          options.bulkProgress.update({
+            total: fileList.length,
+            processed: index + 1,
+            stage: 'read_credentials',
+            stage_label: '读取凭据',
+          })
+          await nextTick()
+        }
+      } else {
         options.bulkProgress.update({
           total: fileList.length,
-          processed: index + 1,
+          processed: fileList.length,
           stage: 'read_credentials',
           stage_label: '读取凭据',
         })
@@ -673,6 +737,9 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
           true,
           true,
         )
+      } else if (importingReg2) {
+        const confirmed = true
+        await importReg2PayloadBatch(reg2Payloads, title, confirmed)
       } else {
         await importAccountPayloadBatch(accountPayloads, 'codex', title, true, false, true, true)
       }
@@ -690,6 +757,53 @@ export function useAccountImportRuntime(options: AccountImportRuntimeOptions) {
       options.setError(`${title}失败`, error, false)
     } finally {
       importBusy.value = false
+    }
+  }
+
+  async function importReg2PayloadBatch(accountPayloads: unknown[], title: string, alreadyConfirmed = false) {
+    if (!alreadyConfirmed) {
+      const confirmed = await confirmDialog.ask({
+        title,
+        message: `即将导入 ${accountPayloads.length} 个 reg2 账号。已存在账号会更新凭据，导入后同步账号与额度。是否继续？`,
+        confirmText: '确认导入',
+        cancelText: '取消',
+      })
+      if (!confirmed) return
+    }
+    options.bulkProgress.update({
+      total: accountPayloads.length,
+      processed: 0,
+      stage: 'save_accounts',
+      stage_label: '保存账号',
+    })
+    const result = await accountsApi.importReg2Accounts(accountPayloads, {
+      syncAfterImport: true,
+      returnItems: false,
+      targetGroupId: targetGroupId(),
+    })
+    const failed = result.errors.length
+    const skippedRows = result.invalid + result.missing_access_token + result.missing_password
+    options.bulkProgress.appendEvents(result.events || [])
+    options.bulkProgress.finish({
+      total: accountPayloads.length,
+      processed: accountPayloads.length,
+      stage: 'completed',
+      stage_label: '完成',
+      import_result: {
+        added: result.added,
+        skipped: result.skipped + skippedRows,
+        synced: result.synced,
+        failed,
+      },
+    })
+    options.bulkProgress.end()
+    refreshAccountListInBackground()
+    void options.loadGroups?.({ silentErrorToast: true })
+    if (skippedRows > 0) {
+      toast.warning(`reg2 导入跳过 ${skippedRows} 行：坏行 ${result.invalid}，缺 AT ${result.missing_access_token}，缺密码 ${result.missing_password}`)
+    }
+    if (result.errors.length > 0) {
+      await promptRemoveImportedAbnormalAccounts(result.updated_ids, result.errors.length)
     }
   }
 

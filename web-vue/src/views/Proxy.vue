@@ -148,44 +148,28 @@
           <Button size="sm" variant="primary" @click="openCreateGroupModal">新建代理组</Button>
         </template>
       </PanelHeader>
-      <TableShell
-        unframed
-        hover-rows
-        sticky-header
-        :scroll-mode="isWorkspaceLayout ? 'contained' : 'page'"
-        :loading="loading && filteredGroups.length === 0"
-        loading-title="正在加载代理"
-        loading-description="读取代理组、节点和健康状态。"
-        :show-empty="!loading && filteredGroups.length === 0"
-        :empty-colspan="6"
-        empty-title="暂无代理组"
-        empty-description="新建代理组后，可绑定账号组、账号或默认出口使用。"
-        :scroll-class="isWorkspaceLayout ? 'max-h-[min(36rem,65dvh)]' : ''"
-        table-class="min-w-[1080px] w-full table-fixed text-left text-sm"
-        head-class="tracking-[0.16em]"
+      <PageLoadingState
+        v-if="loading && filteredGroups.length === 0"
+        title="正在加载代理"
+        description="读取代理组、节点和健康状态。"
+      />
+      <div v-else-if="!loading && filteredGroups.length === 0" class="py-8">
+        <EmptyState
+          plain
+          title="暂无代理组"
+          description="新建代理组后，可绑定账号组、账号或默认出口使用。"
+        />
+      </div>
+      <div
+        v-else
+        class="proxy-group-results"
+        :class="isWorkspaceLayout ? 'proxy-group-results--contained scrollbar-slim' : ''"
       >
-        <template #colgroup>
-          <col class="w-[20%]" />
-          <col class="w-[7rem]" />
-          <col class="w-[30%]" />
-          <col class="w-[15%]" />
-          <col class="w-[16%]" />
-          <col class="w-[16rem]" />
-        </template>
-        <template #head>
-          <tr>
-            <th class="py-3 pr-4">代理组</th>
-            <th class="py-3 pr-4">状态</th>
-            <th class="py-3 pr-4">节点</th>
-            <th class="py-3 pr-4">引用</th>
-            <th class="py-3 pr-4">健康</th>
-            <th class="py-3 text-right">操作</th>
-          </tr>
-        </template>
-        <ProxyGroupRow
+        <ProxyGroupCard
           v-for="group in filteredGroups"
           :key="group.id"
           :group="group"
+          :is-default="effectiveDefault.group_id === group.id"
           :testing-key="testingKey"
           :saving-group-id="savingGroupId"
           :deleting-group-id="deletingGroupId"
@@ -193,14 +177,13 @@
           :node-test-class="nodeTestClass"
           @copy-reference="copyProxyGroupReference"
           @edit="openEditGroupModal"
+          @save-concurrency="saveProxyNodeConcurrency"
           @action="handleProxyGroupAction"
         />
-        <template #footer>
-          <div class="flex justify-end pt-3">
-            <ListLayoutControl v-model="listLayoutMode" />
-          </div>
-        </template>
-      </TableShell>
+      </div>
+      <div class="flex justify-end pt-1">
+        <ListLayoutControl v-model="listLayoutMode" />
+      </div>
     </PagePanel>
 
     <ModalShell
@@ -375,13 +358,12 @@
 </template>
 
 <script setup lang="ts">
-import { Icon } from '@iconify/vue'
 import {
   Button,
   Checkbox,
+  EmptyState,
   GroupedSelectMenu,
   Input,
-  TableShell,
 } from 'nanocat-ui'
 import ActionRow from '@/components/ai/ActionRow.vue'
 import ListLayoutControl from '@/components/ai/ListLayoutControl.vue'
@@ -392,6 +374,7 @@ import ModalHeader from '@/components/ai/ModalHeader.vue'
 import ModalShell from '@/components/ai/ModalShell.vue'
 import OperationProgressDrawer from '@/components/ai/OperationProgressDrawer.vue'
 import PagePanel from '@/components/ai/PagePanel.vue'
+import PageLoadingState from '@/components/ai/PageLoadingState.vue'
 import PanelHeader from '@/components/ai/PanelHeader.vue'
 import { usePageVisibilityReload } from '@/composables/usePageQuery'
 import { usePageRuntime } from '@/composables/usePageRuntime'
@@ -407,7 +390,7 @@ import {
   normalizeImageConcurrencyLimit,
   useProxyGroupRuntime,
 } from '@/views/proxy/proxyGroupRuntime'
-import ProxyGroupRow from '@/views/proxy/ProxyGroupRow.vue'
+import ProxyGroupCard from '@/views/proxy/ProxyGroupCard.vue'
 import ProxyNodeImportModal from '@/views/proxy/ProxyNodeImportModal.vue'
 
 defineOptions({ name: 'Proxy' })
@@ -439,6 +422,7 @@ const addGroupNode = proxyGroupsRuntime.addGroupNode
 const removeGroupNode = proxyGroupsRuntime.removeGroupNode
 const applyNodeImport = proxyGroupsRuntime.applyNodeImport
 const saveProxyGroup = proxyGroupsRuntime.saveProxyGroup
+const saveProxyNodeConcurrency = proxyGroupsRuntime.saveProxyNodeConcurrency
 const handleProxyGroupAction = proxyGroupsRuntime.handleProxyGroupAction
 const testProxyGroupNode = proxyGroupsRuntime.testProxyGroupNode
 const nodeTestSummary = proxyGroupsRuntime.nodeTestSummary
@@ -511,3 +495,23 @@ pageRuntime.onDeactivate(() => {
   deactivateProxyView()
 })
 </script>
+
+<style scoped>
+.proxy-group-results {
+  display: grid;
+  gap: 12px;
+}
+
+.proxy-group-results--contained {
+  min-height: 0;
+  max-height: min(42rem, 65dvh);
+  overflow-y: auto;
+  padding: 2px 4px 2px 1px;
+}
+
+@media (max-width: 640px) {
+  .proxy-group-results--contained {
+    max-height: min(36rem, 60dvh);
+  }
+}
+</style>

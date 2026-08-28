@@ -2,6 +2,7 @@ import { computed, ref, toRef } from 'vue'
 import { accountsApi } from '@/api/accounts'
 import type {
   Account,
+  AccountQuotaFilter,
 } from '@/api/accounts'
 import { usePageRuntime } from '@/composables/usePageRuntime'
 import { usePagedQuery } from '@/composables/usePageQuery'
@@ -37,6 +38,7 @@ export function useAccountsPage() {
   const keyword = ref('')
   const statusFilter = ref<AccountStatusFilter>('all')
   const groupFilter = ref('all')
+  const quotaFilter = ref<AccountQuotaFilter>('all')
   const pageSize = ref(DEFAULT_PAGE_SIZE)
   const accounts = ref<Account[]>([])
   const accountAllTotal = ref(0)
@@ -56,6 +58,7 @@ export function useAccountsPage() {
       keyword: keyword.value.trim(),
       status: statusFilter.value,
       group_id: groupFilter.value,
+      quota_state: quotaFilter.value,
     }),
     resolvePage: (res) => res.page,
     resolvePageCount: (res) => {
@@ -94,6 +97,13 @@ export function useAccountsPage() {
       value: group.id,
     })),
   ])
+  const quotaFilterOptions = [
+    { label: '全部额度', value: 'all' },
+    { label: '未知额度', value: 'unknown' },
+    { label: '有额度', value: 'available' },
+    { label: '额度耗尽', value: 'exhausted' },
+    { label: '无限额度', value: 'unlimited' },
+  ] as const
 
   const accountSelection = useAccountSelectionRuntime({
     accounts,
@@ -103,6 +113,7 @@ export function useAccountsPage() {
     keyword,
     status: statusFilter,
     groupId: groupFilter,
+    quotaState: quotaFilter,
   })
   const selectedCount = accountSelection.selectedCount
   const scopedSelectionActive = accountSelection.scopedSelectionActive
@@ -349,6 +360,7 @@ export function useAccountsPage() {
     keyword,
     statusFilter,
     groupFilter,
+    quotaFilter,
     pageSizeDefault: DEFAULT_PAGE_SIZE,
     pageSizeOptions: ACCOUNT_PAGE_SIZE_OPTIONS,
     reloadTimerKey: LIST_RELOAD_TIMER_KEY,
@@ -397,6 +409,8 @@ export function useAccountsPage() {
     keyword,
     statusFilter,
     groupFilter,
+    quotaFilter,
+    quotaFilterOptions,
     statusFilterOptions,
     groupFilterOptions,
     editingId,

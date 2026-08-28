@@ -184,6 +184,7 @@ def image_task_row(
         ),
         "error_code": error_code,
         "public_error": public_error,
+        "notice": _text(raw.get("notice")),
         "results": results,
         "actions": {
             "resume_poll": status == "failed" and raw.get("can_resume_poll") is True,
