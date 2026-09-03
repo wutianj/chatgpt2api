@@ -1,61 +1,59 @@
-"""CLIProxyAPI integration for browsing remote auth files and importing selected tokens."""
+"""CLIProxyAPI integration for browsing and importing remote account files."""
 
 from __future__ import annotations
 
-import json
-import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
-from pathlib import Path
-from threading import Lock
 
 from curl_cffi.requests import Session
 
-from services.account_service import account_service
-from services.config import DATA_DIR
+from services.account_import_credentials import (
+    collect_import_diagnostic_values,
+    extract_import_credentials,
+)
+from services.account_import_job import (
+    RemoteAccountImportJob,
+    RemoteImportJobCoordinator,
+    normalize_import_error as _normalize_import_error,
+    normalize_import_job as _normalize_import_job,
+)
+from services.account_processing import (
+    account_processing_slot,
+    account_processing_worker_count,
+)
 from services.proxy_service import proxy_settings
-
-
-CPA_CONFIG_FILE = DATA_DIR / "cpa_config.json"
+from services.remote_import_job_status import import_job_is_active
+from services.storage.remote_import_configuration_repository import (
+    RemoteImportConfigurationRepository,
+)
 
 
 def _new_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _normalize_import_job(raw: object, *, fail_unfinished: bool) -> dict | None:
-    if not isinstance(raw, dict):
-        return None
-    status = str(raw.get("status") or "failed").strip() or "failed"
-    if fail_unfinished and status in {"pending", "running"}:
-        status = "failed"
+def _import_error_context(pool: dict, *sources: object) -> dict[str, tuple[str, ...]]:
+    sensitive_values, proxy_values = collect_import_diagnostic_values(
+        {"secret_key": pool.get("secret_key")},
+        *sources,
+    )
     return {
-        "job_id": str(raw.get("job_id") or uuid.uuid4().hex).strip(),
-        "status": status,
-        "created_at": str(raw.get("created_at") or _now_iso()).strip() or _now_iso(),
-        "updated_at": str(raw.get("updated_at") or raw.get("created_at") or _now_iso()).strip() or _now_iso(),
-        "total": int(raw.get("total") or 0),
-        "completed": int(raw.get("completed") or 0),
-        "added": int(raw.get("added") or 0),
-        "skipped": int(raw.get("skipped") or 0),
-        "refreshed": int(raw.get("refreshed") or 0),
-        "failed": int(raw.get("failed") or 0),
-        "errors": raw.get("errors") if isinstance(raw.get("errors"), list) else [],
+        "sensitive_values": sensitive_values,
+        "proxy_values": proxy_values,
     }
 
-
-def _normalize_pool(raw: dict) -> dict:
+def _normalize_pool(raw: dict, *, fail_unfinished: bool = True) -> dict:
+    secret_key = str(raw.get("secret_key") or "").strip()
     return {
         "id": str(raw.get("id") or _new_id()).strip(),
         "name": str(raw.get("name") or "").strip(),
         "base_url": str(raw.get("base_url") or "").strip(),
-        "secret_key": str(raw.get("secret_key") or "").strip(),
-        "import_job": _normalize_import_job(raw.get("import_job"), fail_unfinished=True),
+        "secret_key": secret_key,
+        "import_job": _normalize_import_job(
+            raw.get("import_job"),
+            fail_unfinished=fail_unfinished,
+            **_import_error_context({"secret_key": secret_key}),
+        ),
     }
 
 
@@ -67,85 +65,128 @@ def _management_headers(secret_key: str) -> dict[str, str]:
 
 
 class CPAConfig:
-    def __init__(self, store_file: Path):
-        self._store_file = store_file
-        self._lock = Lock()
-        self._pools: list[dict] = self._load()
+    def __init__(
+        self,
+        repository: RemoteImportConfigurationRepository | None = None,
+        *,
+        database_url: str | None = None,
+    ) -> None:
+        if repository is not None and database_url is not None:
+            raise ValueError("provide repository or database_url, not both")
+        self.repository = repository or RemoteImportConfigurationRepository(database_url)
+        self._import_jobs = RemoteImportJobCoordinator(self.repository)
+        self.repository.update(
+            "cpa",
+            lambda items: self._normalize_items(items, fail_unfinished=True),
+        )
+
+    @staticmethod
+    def _normalize_items(items: list[dict], *, fail_unfinished: bool) -> list[dict]:
+        return [
+            _normalize_pool(item, fail_unfinished=fail_unfinished)
+            for item in items
+            if isinstance(item, dict)
+        ]
 
     def _load(self) -> list[dict]:
-        if not self._store_file.exists():
-            return []
-        try:
-            raw = json.loads(self._store_file.read_text(encoding="utf-8"))
-            if isinstance(raw, dict) and "base_url" in raw:
-                pool = _normalize_pool(raw)
-                return [pool] if pool["base_url"] else []
-            if isinstance(raw, list):
-                return [_normalize_pool(item) for item in raw if isinstance(item, dict)]
-        except Exception:
-            pass
-        return []
-
-    def _save(self) -> None:
-        self._store_file.parent.mkdir(parents=True, exist_ok=True)
-        self._store_file.write_text(json.dumps(self._pools, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return self._normalize_items(
+            self.repository.load("cpa"),
+            fail_unfinished=False,
+        )
 
     def list_pools(self) -> list[dict]:
-        with self._lock:
-            return [dict(pool) for pool in self._pools]
+        return [dict(pool) for pool in self._load()]
 
     def get_pool(self, pool_id: str) -> dict | None:
-        with self._lock:
-            for pool in self._pools:
-                if pool["id"] == pool_id:
-                    return dict(pool)
+        for pool in self._load():
+            if pool["id"] == pool_id:
+                return dict(pool)
         return None
 
     def add_pool(self, name: str, base_url: str, secret_key: str) -> dict:
-        pool = _normalize_pool({"id": _new_id(), "name": name, "base_url": base_url, "secret_key": secret_key})
-        with self._lock:
-            self._pools.append(pool)
-            self._save()
+        pool = _normalize_pool({"id": _new_id(), "name": name, "base_url": base_url, "secret_key": secret_key}, fail_unfinished=False)
+        self.repository.update("cpa", lambda items: [*items, pool])
         return dict(pool)
 
     def update_pool(self, pool_id: str, updates: dict) -> dict | None:
-        with self._lock:
-            for index, pool in enumerate(self._pools):
+        result: dict | None = None
+
+        def update(items: list[dict]) -> list[dict]:
+            nonlocal result
+            pools = self._normalize_items(items, fail_unfinished=False)
+            for index, pool in enumerate(pools):
                 if pool["id"] != pool_id:
                     continue
+                if import_job_is_active(pool.get("import_job")):
+                    raise ValueError("CPA import job is active")
                 merged = {**pool, **{key: value for key, value in updates.items() if value is not None}, "id": pool_id}
-                self._pools[index] = _normalize_pool(merged)
-                self._save()
-                return dict(self._pools[index])
-        return None
+                pools[index] = _normalize_pool(merged, fail_unfinished=False)
+                result = dict(pools[index])
+                break
+            return pools
+
+        self.repository.update("cpa", update)
+        return result
 
     def delete_pool(self, pool_id: str) -> bool:
-        with self._lock:
-            before = len(self._pools)
-            self._pools = [pool for pool in self._pools if pool["id"] != pool_id]
-            if len(self._pools) < before:
-                self._save()
-                return True
-        return False
+        removed = False
 
-    def set_import_job(self, pool_id: str, import_job: dict | None) -> dict | None:
-        with self._lock:
-            for index, pool in enumerate(self._pools):
+        def delete(items: list[dict]) -> list[dict]:
+            nonlocal removed
+            pools = self._normalize_items(items, fail_unfinished=False)
+            for pool in pools:
+                if pool["id"] == pool_id and import_job_is_active(pool.get("import_job")):
+                    raise ValueError("CPA import job is active")
+            remaining = [pool for pool in pools if pool["id"] != pool_id]
+            removed = len(remaining) < len(pools)
+            return remaining
+
+        self.repository.update("cpa", delete)
+        return removed
+
+    def set_import_job(self, pool_id: str, import_job: dict | None, *, expected_job_id: str | None = None) -> dict | None:
+        result: dict | None = None
+
+        def update(items: list[dict]) -> list[dict]:
+            nonlocal result
+            pools = self._normalize_items(items, fail_unfinished=False)
+            for index, pool in enumerate(pools):
                 if pool["id"] != pool_id:
                     continue
+                current_job = pool.get("import_job")
+                current_job_id = str((current_job or {}).get("job_id") or "").strip()
+                if expected_job_id is not None and current_job_id != str(expected_job_id).strip():
+                    return pools
                 next_pool = dict(pool)
-                next_pool["import_job"] = _normalize_import_job(import_job, fail_unfinished=False)
-                self._pools[index] = next_pool
-                self._save()
-                return dict(next_pool)
-        return None
+                next_pool["import_job"] = _normalize_import_job(
+                    import_job,
+                    fail_unfinished=False,
+                    **_import_error_context(pool),
+                )
+                pools[index] = next_pool
+                result = dict(next_pool)
+                break
+            return pools
+
+        self.repository.update("cpa", update)
+        return result
+
+    def start_import_job(self, pool_id: str, import_job: dict) -> dict | None:
+        pool = self.get_pool(pool_id)
+        if pool is None:
+            return None
+        normalized_job = _normalize_import_job(
+            import_job,
+            fail_unfinished=False,
+            **_import_error_context(pool),
+        )
+        return self._import_jobs.reserve("cpa", pool_id, normalized_job)
 
     def get_import_job(self, pool_id: str) -> dict | None:
-        with self._lock:
-            for pool in self._pools:
-                if pool["id"] == pool_id:
-                    job = pool.get("import_job")
-                    return dict(job) if isinstance(job, dict) else None
+        for pool in self._load():
+            if pool["id"] == pool_id:
+                job = pool.get("import_job")
+                return dict(job) if isinstance(job, dict) else None
         return None
 
 
@@ -156,14 +197,29 @@ def list_remote_files(pool: dict) -> list[dict]:
         return []
 
     url = f"{base_url.rstrip('/')}/v0/management/auth-files"
-    session = Session(**proxy_settings.build_session_kwargs(verify=True))
+    error_context = _import_error_context(pool)
+    session = None
     try:
+        session_kwargs = proxy_settings.build_session_kwargs(verify=True)
+        error_context = _import_error_context(
+            pool,
+            {"proxy": session_kwargs.get("proxy")},
+        )
+        session = Session(**session_kwargs)
         response = session.get(url, headers=_management_headers(secret_key), timeout=30)
         if not response.ok:
             raise RuntimeError(f"remote list failed: HTTP {response.status_code}")
         payload = response.json()
+    except Exception as exc:
+        error = _normalize_import_error(
+            exc,
+            default_name="CPA server",
+            **error_context,
+        )["error"]
+        raise RuntimeError(error) from None
     finally:
-        session.close()
+        if session is not None:
+            session.close()
 
     files = payload.get("files") if isinstance(payload, dict) else None
     if not isinstance(files, list):
@@ -181,7 +237,7 @@ def list_remote_files(pool: dict) -> list[dict]:
     return items
 
 
-def fetch_remote_access_token(pool: dict, file_name: str) -> tuple[str | None, str | None]:
+def fetch_remote_account_payload(pool: dict, file_name: str) -> tuple[dict | None, str | None]:
     base_url = str(pool.get("base_url") or "").strip()
     secret_key = str(pool.get("secret_key") or "").strip()
     file_name = str(file_name or "").strip()
@@ -189,127 +245,153 @@ def fetch_remote_access_token(pool: dict, file_name: str) -> tuple[str | None, s
         return None, "invalid request"
 
     url = f"{base_url.rstrip('/')}/v0/management/auth-files/download"
-    session = Session(**proxy_settings.build_session_kwargs(verify=True))
+    error_context = _import_error_context(pool)
+    session = None
     try:
+        session_kwargs = proxy_settings.build_session_kwargs(verify=True)
+        error_context = _import_error_context(
+            pool,
+            {"proxy": session_kwargs.get("proxy")},
+        )
+        session = Session(**session_kwargs)
         response = session.get(url, headers=_management_headers(secret_key), params={"name": file_name}, timeout=30)
         if not response.ok:
             return None, f"HTTP {response.status_code}"
         payload = response.json()
     except Exception as exc:
-        return None, str(exc)
+        return None, _normalize_import_error(
+            exc,
+            default_name=file_name,
+            **error_context,
+        )["error"]
     finally:
-        session.close()
+        if session is not None:
+            session.close()
 
     if not isinstance(payload, dict):
         return None, "invalid payload"
 
-    access_token = str(payload.get("access_token") or "").strip()
-    if not access_token:
+    account_payload = extract_import_credentials(payload)
+    if not account_payload.get("access_token"):
         return None, "missing access_token"
-    return access_token, None
+    account_payload["source_type"] = "codex"
+    return account_payload, None
 
 
 class CPAImportService:
     def __init__(self, cpa_config: CPAConfig):
         self._config = cpa_config
 
-    def start_import(self, pool: dict, selected_files: list[str]) -> dict:
-        names = [str(name or "").strip() for name in selected_files if str(name or "").strip()]
+    def _job(
+        self,
+        pool_id: str,
+        pool: dict,
+        total: int,
+        *,
+        job_id: str = "",
+    ) -> RemoteAccountImportJob:
+        return RemoteAccountImportJob(
+            self._config,
+            source_id=pool_id,
+            total=total,
+            worker_label="CPA import worker",
+            error_context=lambda *sources: _import_error_context(pool, *sources),
+            job_id=job_id,
+        )
+
+    def start_import(
+        self,
+        pool: dict,
+        selected_files: list[str],
+        *,
+        target_group_id: str | None = None,
+    ) -> dict:
+        names = list(dict.fromkeys(str(name or "").strip() for name in selected_files if str(name or "").strip()))
         if not names:
             raise ValueError("selected files is required")
 
         pool_id = str(pool.get("id") or "").strip()
-        job = {
-            "job_id": uuid.uuid4().hex,
-            "status": "pending",
-            "created_at": _now_iso(),
-            "updated_at": _now_iso(),
-            "total": len(names),
-            "completed": 0,
-            "added": 0,
-            "skipped": 0,
-            "refreshed": 0,
-            "failed": 0,
-            "errors": [],
-        }
-        saved_pool = self._config.set_import_job(pool_id, job)
-        if saved_pool is None:
+        import_job = self._job(pool_id, pool, len(names))
+        saved_job = import_job.reserve()
+        if saved_job is None:
             raise ValueError("pool not found")
-
-        thread = threading.Thread(
-            target=self._run_import,
-            args=(pool_id, pool, names),
+        import_job.start_worker(
+            target=self._run_import_guarded,
+            args=(pool_id, pool, names, import_job.job_id, target_group_id),
             name=f"cpa-import-{pool_id}",
-            daemon=True,
         )
-        thread.start()
-        return dict(saved_pool.get("import_job") or job)
+        return saved_job
 
-    def _update_job(self, pool_id: str, **updates) -> dict | None:
-        current = self._config.get_import_job(pool_id)
-        if current is None:
-            return None
-        next_job = {**current, **updates, "updated_at": _now_iso()}
-        pool = self._config.set_import_job(pool_id, next_job)
-        if pool is None:
-            return None
-        job = pool.get("import_job")
-        return dict(job) if isinstance(job, dict) else None
+    def _run_import_guarded(
+        self,
+        pool_id: str,
+        pool: dict,
+        names: list[str],
+        job_id: str,
+        target_group_id: str | None = None,
+    ) -> None:
+        self._job(
+            pool_id,
+            pool,
+            len(names),
+            job_id=job_id,
+        ).run_guarded(
+            self._run_import,
+            pool_id,
+            pool,
+            names,
+            job_id=job_id,
+            target_group_id=target_group_id,
+        )
 
-    def _append_error(self, pool_id: str, file_name: str, message: str) -> None:
-        current = self._config.get_import_job(pool_id)
-        if current is None:
+    def _run_import(
+        self,
+        pool_id: str,
+        pool: dict,
+        names: list[str],
+        job_id: str = "",
+        *,
+        target_group_id: str | None = None,
+    ) -> None:
+        import_job = self._job(
+            pool_id,
+            pool,
+            len(names),
+            job_id=job_id,
+        )
+        if not import_job.begin():
             return
-        errors = list(current.get("errors") or [])
-        errors.append({"name": file_name, "error": message})
-        self._update_job(pool_id, errors=errors, failed=len(errors))
 
-    def _run_import(self, pool_id: str, pool: dict, names: list[str]) -> None:
-        self._update_job(pool_id, status="running")
+        fetched_accounts: list[tuple[str, dict]] = []
+        max_workers = max(1, account_processing_worker_count(len(names)))
 
-        tokens: list[str] = []
-        max_workers = min(16, max(1, len(names)))
+        def fetch(file_name: str) -> tuple[dict | None, str | None]:
+            with account_processing_slot():
+                return fetch_remote_account_payload(pool, file_name)
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {executor.submit(fetch_remote_access_token, pool, name): name for name in names}
+            future_map = {executor.submit(fetch, name): name for name in names}
             for future in as_completed(future_map):
                 file_name = future_map[future]
                 try:
-                    token, error = future.result()
+                    payload, error = future.result()
                 except Exception as exc:
-                    token, error = None, str(exc)
+                    payload, error = None, str(exc)
 
-                if token:
-                    tokens.append(token)
+                if payload:
+                    if target_group_id is not None:
+                        payload["group_id"] = target_group_id
+                    fetched_accounts.append((file_name, payload))
+                    if not import_job.record_fetch(file_name):
+                        return
                 else:
-                    self._append_error(pool_id, file_name, error or "unknown error")
-
-                current = self._config.get_import_job(pool_id) or {}
-                failed = len(current.get("errors") or [])
-                self._update_job(pool_id, completed=int(current.get("completed") or 0) + 1, failed=failed)
-
-        if not tokens:
-            current = self._config.get_import_job(pool_id) or {}
-            self._update_job(
-                pool_id,
-                status="failed",
-                completed=int(current.get("total") or 0),
-                failed=len(current.get("errors") or []),
-            )
-            return
-
-        add_result = account_service.add_accounts(tokens, source_type="codex")
-        refresh_result = account_service.refresh_accounts(tokens)
-        current = self._config.get_import_job(pool_id) or {}
-        self._update_job(
-            pool_id,
-            status="completed",
-            completed=len(names),
-            added=int(add_result.get("added") or 0),
-            skipped=int(add_result.get("skipped") or 0),
-            refreshed=int(refresh_result.get("refreshed") or 0),
-            failed=len(current.get("errors") or []),
-        )
+                    if not import_job.record_fetch(
+                        file_name,
+                        error=error or "unknown error",
+                    ):
+                        return
+        import_job.finish(fetched_accounts)
 
 
-cpa_config = CPAConfig(CPA_CONFIG_FILE)
+cpa_config = CPAConfig()
 cpa_import_service = CPAImportService(cpa_config)

@@ -1,29 +1,32 @@
 services:
   app:
-    image: ghcr.io/basketikun/chatgpt2api:latest
+    image: ${CHATGPT2API_IMAGE:-ghcr.io/yukkcat/chatgpt2api:latest}
     container_name: chatgpt2api
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:80/version', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     ports:
-      - "3000:80"
+      - "${CHATGPT2API_PORT:-3000}:80"
     volumes:
+      - chatgpt2api-runtime:/app
       - ./data:/app/data
       - ./config.json:/app/config.json
     environment:
-      # 存储后端配置 (可选值: json, sqlite, postgres, git)
-       - STORAGE_BACKEND=json
-      
-      # 数据库配置 (当 STORAGE_BACKEND=sqlite/postgres 时使用)
-      # - DATABASE_URL=postgresql://user:password@host:5432/dbname
-      # - DATABASE_URL=sqlite:///app/data/accounts.db
-      
-      # Git 仓库配置 (当 STORAGE_BACKEND=git 时使用)
-      # - GIT_REPO_URL=https://github.com/user/repo.git
-      # - GIT_TOKEN=ghp_xxxxxxxxxxxx
-      # - GIT_BRANCH=main
-      # - GIT_FILE_PATH=accounts.json
-      
-      # 认证密钥 (可选，覆盖 config.json)
-      # - CHATGPT2API_AUTH_KEY=your_secret_key
-      
-      # 基础 URL (可选)
-      # - CHATGPT2API_BASE_URL=https://your-domain.com
+      DATABASE_URL: ${DATABASE_URL:-}
+      CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
+      CHATGPT2API_BASE_URL: ${CHATGPT2API_BASE_URL:-}
+      CHATGPT2API_CANVAS_TOKEN_TTL_SECONDS: ${CHATGPT2API_CANVAS_TOKEN_TTL_SECONDS:-86400}
+      CHATGPT2API_PAYMENT_WEBHOOK_SECRET: ${CHATGPT2API_PAYMENT_WEBHOOK_SECRET:-}
+      CHATGPT2API_CHAT_COST_UNITS: ${CHATGPT2API_CHAT_COST_UNITS:-1}
+      CHATGPT2API_IMAGE_COST_UNITS: ${CHATGPT2API_IMAGE_COST_UNITS:-10}
+      CHATGPT2API_SEARCH_COST_UNITS: ${CHATGPT2API_SEARCH_COST_UNITS:-2}
+      CHATGPT2API_FILE_COST_UNITS: ${CHATGPT2API_FILE_COST_UNITS:-20}
+      CHATGPT2API_THREAD_TOKENS: ${CHATGPT2API_THREAD_TOKENS:-120}
+      TZ: ${TZ:-Asia/Shanghai}
+
+volumes:
+  chatgpt2api-runtime:

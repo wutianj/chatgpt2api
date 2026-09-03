@@ -1,0 +1,3 @@
+{"source":"reg2","source_type":"web","email":"reg2-sample-1@example.test","password":"example-password-1","access_token":"sample-access-token-1","refresh_token":"sample-refresh-token-1","plan_type":"plus","reg2_group":"reg2 sample group","registration_country":"JP","totp_secret":"JBSWY3DPEHPK3PXP","batch_id":"sample-batch"}
+{"source":"reg2","source_type":"web","email":"missing-token@example.test","password":"example-password-2"}
+{"source":"reg2","source_type":"web","email":"missing-password@example.test","access_token":"sample-access-token-3"}

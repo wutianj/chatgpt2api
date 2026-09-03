@@ -7,10 +7,13 @@ from fastapi import HTTPException, Request
 
 from services.account_service import account_service
 from services.auth_service import auth_service
+from services.canvas_token_service import canvas_token_service
 from services.config import config
+from services.user_auth_service import user_auth_service
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 WEB_DIST_DIR = BASE_DIR / "web_dist"
+_WEB_RESERVED_ROOTS = frozenset({"api", "v1", "auth", "images", "image-thumbnails"})
 
 
 def extract_bearer_token(authorization: str | None) -> str:
@@ -29,9 +32,35 @@ def _legacy_admin_identity(token: str) -> dict[str, object] | None:
 
 def require_identity(authorization: str | None) -> dict[str, object]:
     token = extract_bearer_token(authorization)
-    identity = _legacy_admin_identity(token) or auth_service.authenticate(token)
+    identity = (
+        user_auth_service.authenticate_session(token)
+        or user_auth_service.authenticate_api_key(token)
+        or _legacy_admin_identity(token)
+        or auth_service.authenticate(token)
+    )
     if identity is None:
         raise HTTPException(status_code=401, detail={"error": "密钥无效或已失效，请重新登录"})
+    return identity
+
+
+def require_ai_identity(authorization: str | None) -> dict[str, object]:
+    token = extract_bearer_token(authorization)
+    identity = (
+        user_auth_service.authenticate_session(token)
+        or user_auth_service.authenticate_api_key(token)
+        or _legacy_admin_identity(token)
+        or auth_service.authenticate(token)
+        or canvas_token_service.authenticate(token)
+    )
+    if identity is None:
+        raise HTTPException(status_code=401, detail={"error": "密钥无效或已失效，请重新登录"})
+    return identity
+
+
+def require_user(authorization: str | None) -> dict[str, object]:
+    identity = require_identity(authorization)
+    if identity.get("role") not in {"user", "admin"}:
+        raise HTTPException(status_code=403, detail={"error": "需要用户权限"})
     return identity
 
 
@@ -48,13 +77,6 @@ def require_admin(authorization: str | None) -> dict[str, object]:
 
 def resolve_image_base_url(request: Request) -> str:
     return config.base_url or f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
-
-
-def raise_image_quota_error(exc: Exception) -> None:
-    message = str(exc)
-    if "no available image quota" in message.lower():
-        raise HTTPException(status_code=429, detail={"error": "no available image quota"}) from exc
-    raise HTTPException(status_code=502, detail={"error": message}) from exc
 
 
 def sanitize_cpa_pool(pool: dict | None) -> dict | None:
@@ -79,45 +101,53 @@ def sanitize_sub2api_servers(servers: list[dict]) -> list[dict]:
     return [sanitized for server in servers if (sanitized := sanitize_sub2api_server(server)) is not None]
 
 
-def start_limited_account_watcher(stop_event: Event) -> Thread:
-    interval_seconds = config.refresh_account_interval_minute * 60
-
+def start_account_lifecycle_watcher(stop_event: Event) -> Thread:
     def worker() -> None:
         while not stop_event.is_set():
             try:
-                limited_tokens = account_service.list_limited_tokens()
-                normal_tokens = account_service.list_normal_tokens()
+                pending_auth = account_service.list_pending_auth_verification_tokens()
+                if pending_auth:
+                    account_service.resume_pending_auth_verifications()
                 expiring_tokens = account_service.list_expiring_access_tokens()
-                keepalive_tokens = account_service.list_refresh_token_keepalive_tokens()
-                tokens = list(dict.fromkeys([*limited_tokens, *normal_tokens, *expiring_tokens]))
-                expiring_token_set = set(expiring_tokens)
-                keepalive_tokens = [token for token in keepalive_tokens if token not in expiring_token_set]
-                if tokens:
+                if expiring_tokens:
                     print(
-                        "[account-watcher] checking "
-                        f"{len(limited_tokens)} limited accounts, "
-                        f"{len(normal_tokens)} normal accounts, "
+                        "[account-watcher] renewing "
                         f"{len(expiring_tokens)} expiring access tokens"
                     )
-                    account_service.refresh_accounts(tokens)
-                if keepalive_tokens:
-                    print(f"[account-watcher] keepalive {len(keepalive_tokens)} refresh tokens")
-                    result = account_service.keepalive_refresh_tokens(keepalive_tokens)
+                    result = account_service.renew_expiring_access_tokens(expiring_tokens)
                     if result.get("errors"):
-                        print(f"[account-watcher] keepalive errors: {result['errors']}")
+                        print(f"[account-watcher] renewal errors: {result['errors']}")
+
+                limited_tokens = account_service.list_limited_tokens()
+                normal_tokens = account_service.list_normal_tokens()
+                if limited_tokens:
+                    print(
+                        "[account-watcher] syncing "
+                        f"{len(limited_tokens)} limited accounts "
+                        f"(skipping {len(normal_tokens)} healthy accounts, "
+                        f"recovering {len(pending_auth)} pending auth accounts)"
+                    )
+                    account_service.sync_accounts_and_quota(limited_tokens)
             except Exception as exc:
                 print(f"[account-watcher] fail {exc}")
-            stop_event.wait(interval_seconds)
+            stop_event.wait(config.refresh_account_interval_minute * 60)
 
-    thread = Thread(target=worker, name="account-watcher", daemon=True)
+    thread = Thread(target=worker, name="account-lifecycle-watcher", daemon=True)
     thread.start()
     return thread
+
+
+def start_limited_account_watcher(stop_event: Event) -> Thread:
+    """Compatibility alias for integrations importing the old watcher name."""
+    return start_account_lifecycle_watcher(stop_event)
 
 
 def resolve_web_asset(requested_path: str) -> Path | None:
     if not WEB_DIST_DIR.exists():
         return None
     clean_path = requested_path.strip("/")
+    if clean_path and clean_path.split("/", 1)[0].lower() in _WEB_RESERVED_ROOTS:
+        return None
     base_dir = WEB_DIST_DIR.resolve()
     candidates = [base_dir / "index.html"] if not clean_path else [
         base_dir / Path(clean_path),
@@ -131,4 +161,8 @@ def resolve_web_asset(requested_path: str) -> Path | None:
             continue
         if candidate.is_file():
             return candidate
+    if clean_path and "." not in clean_path.rsplit("/", 1)[-1]:
+        index = base_dir / "index.html"
+        if index.is_file():
+            return index
     return None

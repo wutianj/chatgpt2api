@@ -6,18 +6,23 @@ import io
 import json
 import os
 import random
+import sqlite3
 import subprocess
 import tarfile
+import tempfile
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote, urlencode
 
 from curl_cffi import requests
+from sqlalchemy import make_url
 
-from services.config import BASE_DIR, CONFIG_FILE, DATA_DIR, config, load_backup_state, save_backup_state
+from services.application_database import database_backend_name
+from services.config import DATA_DIR, config
 from services.image_storage_service import IMAGE_INDEX_FILE
 from services.image_tags_service import TAGS_FILE
+from services.storage.coordination_repository import BackupExecutionStateRepository
 
 
 def _utc_now() -> datetime:
@@ -30,6 +35,20 @@ def _iso_now() -> str:
 
 def _clean(value: object) -> str:
     return str(value or "").strip()
+
+
+def _normalize_backup_state(value: object) -> dict[str, object]:
+    source = value if isinstance(value, dict) else {}
+    status = _clean(source.get("last_status")) or "idle"
+    if status not in {"idle", "running", "success", "error"}:
+        status = "idle"
+    return {
+        "last_started_at": _clean(source.get("last_started_at")) or None,
+        "last_finished_at": _clean(source.get("last_finished_at")) or None,
+        "last_status": status,
+        "last_error": _clean(source.get("last_error")) or None,
+        "last_object_key": _clean(source.get("last_object_key")) or None,
+    }
 
 
 def _sha256_hex(value: bytes) -> str:
@@ -75,58 +94,8 @@ def _openssl_encrypt(data: bytes, passphrase: str) -> bytes:
     return result.stdout
 
 
-def _openssl_decrypt(data: bytes, passphrase: str) -> bytes:
-    env = dict(os.environ)
-    env["CHATGPT2API_BACKUP_PASSPHRASE"] = passphrase
-    try:
-        result = subprocess.run(
-            [
-                "openssl",
-                "enc",
-                "-d",
-                "-aes-256-cbc",
-                "-pbkdf2",
-                "-md",
-                "sha256",
-                "-pass",
-                "env:CHATGPT2API_BACKUP_PASSPHRASE",
-            ],
-            input=data,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=True,
-            env=env,
-        )
-    except FileNotFoundError as exc:
-        raise BackupError("当前环境缺少 openssl，无法解密备份内容") from exc
-    except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
-        raise BackupError(f"解密备份失败：{detail or 'openssl 执行失败'}") from exc
-    return result.stdout
-
-
-def _guess_content_type(name: str) -> str:
-    if name.endswith(".json"):
-        return "application/json"
-    if name.endswith(".jsonl"):
-        return "application/x-ndjson"
-    if name.endswith(".tar.gz"):
-        return "application/gzip"
-    if name.endswith(".gz"):
-        return "application/gzip"
-    return "application/octet-stream"
-
-
 def _json_bytes(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
-
-
-def _count_items(value: object) -> int:
-    if isinstance(value, list):
-        return len(value)
-    if isinstance(value, dict):
-        return len(value)
-    return 0
 
 
 class BackupError(RuntimeError):
@@ -257,12 +226,6 @@ class CloudflareR2Client:
         if response.status_code >= 400 and response.status_code != 404:
             raise BackupError(f"删除备份失败：HTTP {response.status_code}")
 
-    def download_bytes(self, key: str) -> bytes:
-        response = self._request("GET", key, timeout=60.0)
-        if response.status_code >= 400:
-            raise BackupError(f"读取备份失败：HTTP {response.status_code}")
-        return bytes(response.content or b"")
-
     def list_objects(self) -> list[dict[str, object]]:
         items: list[dict[str, object]] = []
         continuation = ""
@@ -301,11 +264,36 @@ class CloudflareR2Client:
 
 
 class BackupService:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        repository: BackupExecutionStateRepository | None = None,
+        database_url: str | None = None,
+    ) -> None:
+        if repository is not None and database_url is not None:
+            raise ValueError("provide repository or database_url, not both")
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._running = False
+        self._repository = repository or BackupExecutionStateRepository(database_url)
+        self._recover_interrupted_execution()
+
+    def _recover_interrupted_execution(self) -> None:
+        try:
+            with self._repository.run_lock(timeout_seconds=0):
+                state = _normalize_backup_state(self._repository.load())
+                if state["last_status"] != "running":
+                    return
+                state.update({
+                    "last_finished_at": _iso_now(),
+                    "last_status": "error",
+                    "last_error": "备份执行被进程重启中断",
+                })
+                self._repository.replace(state)
+        except TimeoutError:
+            # Another process still owns the backup execution lease.
+            return
 
     def start(self) -> None:
         with self._lock:
@@ -351,10 +339,8 @@ class BackupService:
         self.run_backup(trigger="schedule")
 
     def get_status(self) -> dict[str, object]:
-        return {
-            **load_backup_state(),
-            "running": self._running,
-        }
+        state = _normalize_backup_state(self._repository.load())
+        return {**state, "running": self._running or state["last_status"] == "running"}
 
     def is_configured(self) -> bool:
         settings = config.get_backup_settings()
@@ -425,81 +411,45 @@ class BackupService:
         finally:
             client.close()
 
-    def download_backup(self, key: str) -> dict[str, object]:
-        candidate = _clean(key)
-        if not candidate:
-            raise BackupError("备份对象 key 不能为空")
-        client = CloudflareR2Client(config.get_backup_settings())
-        try:
-            payload = client.download_bytes(candidate)
-        finally:
-            client.close()
-        name = candidate.rsplit("/", 1)[-1] or "backup.bin"
-        if candidate.endswith(".enc"):
-            passphrase = _clean(config.get_backup_settings().get("passphrase"))
-            if not passphrase:
-                raise BackupError("当前未配置加密口令，无法下载并解密已加密备份")
-            payload = _openssl_decrypt(payload, passphrase)
-            if name.endswith(".enc"):
-                name = name[:-4] or "backup.tar.gz"
-        return {
-            "key": candidate,
-            "name": name,
-            "content_type": _guess_content_type(name),
-            "payload": payload,
-            "size": len(payload),
-        }
-
-    def get_backup_detail(self, key: str) -> dict[str, object]:
-        candidate = _clean(key)
-        if not candidate:
-            raise BackupError("备份对象 key 不能为空")
-        client = CloudflareR2Client(config.get_backup_settings())
-        try:
-            payload = client.download_bytes(candidate)
-        finally:
-            client.close()
-        detail = self._decode_backup_payload(candidate, payload)
-        detail["key"] = candidate
-        detail["name"] = candidate.rsplit("/", 1)[-1]
-        detail["encrypted"] = candidate.endswith(".enc")
-        return detail
-
     def run_backup(self, *, trigger: str = "manual") -> dict[str, object]:
-        with self._lock:
-            current = self.get_status()
-            if self._running:
-                raise BackupError("当前已有备份任务正在执行")
-            started_at = _iso_now()
-            self._running = True
-            save_backup_state({
-                "last_started_at": started_at,
-                "last_finished_at": current.get("last_finished_at"),
-                "last_status": "idle",
-                "last_error": None,
-                "last_object_key": current.get("last_object_key"),
-            })
         try:
-            result = self._run_backup_once(trigger=trigger)
-            save_backup_state({
-                "last_started_at": started_at,
-                "last_finished_at": _iso_now(),
-                "last_status": "success",
-                "last_error": None,
-                "last_object_key": result["key"],
-            })
-            return result
-        except Exception as exc:
-            save_backup_state({
-                "last_started_at": started_at,
-                "last_finished_at": _iso_now(),
-                "last_status": "error",
-                "last_error": str(exc) or exc.__class__.__name__,
-                "last_object_key": current.get("last_object_key"),
-            })
-            raise
-        finally:
-            self._running = False
+            with self._repository.run_lock(timeout_seconds=0):
+                with self._lock:
+                    current = self.get_status()
+                    if self._running:
+                        raise BackupError("当前已有备份任务正在执行")
+                    started_at = _iso_now()
+                    self._running = True
+                    self._repository.replace({
+                        "last_started_at": started_at,
+                        "last_finished_at": current.get("last_finished_at"),
+                        "last_status": "running",
+                        "last_error": None,
+                        "last_object_key": current.get("last_object_key"),
+                    })
+                try:
+                    result = self._run_backup_once(trigger=trigger)
+                    self._repository.replace({
+                        "last_started_at": started_at,
+                        "last_finished_at": _iso_now(),
+                        "last_status": "success",
+                        "last_error": None,
+                        "last_object_key": result["key"],
+                    })
+                    return result
+                except Exception as exc:
+                    self._repository.replace({
+                        "last_started_at": started_at,
+                        "last_finished_at": _iso_now(),
+                        "last_status": "error",
+                        "last_error": str(exc) or exc.__class__.__name__,
+                        "last_object_key": current.get("last_object_key"),
+                    })
+                    raise
+                finally:
+                    self._running = False
+        except TimeoutError as exc:
+            raise BackupError("当前已有备份任务正在执行") from exc
 
     def _run_backup_once(self, *, trigger: str) -> dict[str, object]:
         settings = config.get_backup_settings()
@@ -535,15 +485,6 @@ class BackupService:
         finally:
             client.close()
 
-    def _decode_backup_payload(self, key: str, payload: bytes) -> dict[str, object]:
-        decoded = payload
-        if key.endswith(".enc"):
-            passphrase = _clean(config.get_backup_settings().get("passphrase"))
-            if not passphrase:
-                raise BackupError("当前未配置加密口令，无法查看已加密备份")
-            decoded = _openssl_decrypt(decoded, passphrase)
-        return self._decode_archive_detail(decoded)
-
     def _apply_rotation(self, client: CloudflareR2Client, keep: int) -> None:
         if keep <= 0:
             return
@@ -555,98 +496,100 @@ class BackupService:
             if key:
                 client.delete_object(key)
 
-    def _decode_archive_detail(self, payload: bytes) -> dict[str, object]:
-        files: list[dict[str, object]] = []
-        snapshots: list[dict[str, object]] = []
-        metadata: dict[str, object] = {}
-        try:
-            with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
-                members = [member for member in archive.getmembers() if member.isfile()]
-                for member in members:
-                    extracted = archive.extractfile(member)
-                    if extracted is None:
-                        continue
-                    raw = extracted.read()
-                    name = member.name
-                    if name == "backup-metadata.json":
-                        try:
-                            parsed = json.loads(raw.decode("utf-8"))
-                            if isinstance(parsed, dict):
-                                metadata = parsed
-                        except Exception:
-                            metadata = {}
-                        continue
-                    if name.startswith("snapshots/") and name.endswith(".json"):
-                        count = 0
-                        try:
-                            parsed_snapshot = json.loads(raw.decode("utf-8"))
-                            count = _count_items(parsed_snapshot)
-                        except Exception:
-                            count = 0
-                        snapshots.append({
-                            "name": name.removeprefix("snapshots/").removesuffix(".json"),
-                            "count": count,
-                        })
-                        continue
-                    files.append({
-                        "name": name,
-                        "exists": True,
-                        "content_type": _guess_content_type(name),
-                        "size": len(raw),
-                        "sha256": _sha256_hex(raw),
-                    })
-        except tarfile.TarError as exc:
-            raise BackupError("解析备份压缩包失败，备份可能已损坏") from exc
-        files.sort(key=lambda item: str(item.get("name") or ""))
-        snapshots.sort(key=lambda item: str(item.get("name") or ""))
-        return {
-            "created_at": metadata.get("created_at"),
-            "trigger": metadata.get("trigger"),
-            "app_version": metadata.get("app_version"),
-            "storage_backend": metadata.get("storage_backend"),
-            "files": files,
-            "snapshots": snapshots,
-        }
-
     def _build_backup_archive(self, settings: dict[str, object], *, trigger: str) -> bytes:
         include = settings.get("include") if isinstance(settings.get("include"), dict) else {}
+        database_backend = database_backend_name(self._repository.database_url)
         metadata = {
-            "version": 2,
+            "version": 3,
             "created_at": _iso_now(),
             "trigger": trigger,
             "app_version": config.app_version,
-            "storage_backend": config.get_storage_backend().get_backend_info(),
+            "database_backend": database_backend,
+            "application_database": config.get_storage_backend().get_backend_info(),
         }
         buffer = io.BytesIO()
         with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
             self._add_bytes_to_archive(archive, "backup-metadata.json", _json_bytes(metadata))
-            if include.get("config"):
-                self._add_file_to_archive(archive, CONFIG_FILE, "config.json")
-            if include.get("cpa"):
-                self._add_file_to_archive(archive, DATA_DIR / "cpa_config.json", "data/cpa_config.json")
-            if include.get("sub2api"):
-                self._add_file_to_archive(archive, DATA_DIR / "sub2api_config.json", "data/sub2api_config.json")
-            if include.get("logs"):
-                self._add_file_to_archive(archive, DATA_DIR / "logs.jsonl", "data/logs.jsonl")
+            database_name = (
+                "data/application-database.sqlite3"
+                if database_backend == "sqlite"
+                else "data/application-database.pgdump"
+            )
+            self._add_bytes_to_archive(
+                archive,
+                database_name,
+                self._application_database_backup(database_backend),
+            )
             if include.get("image_tasks"):
                 self._add_file_to_archive(archive, DATA_DIR / "image_tasks.json", "data/image_tasks.json")
                 self._add_file_to_archive(archive, IMAGE_INDEX_FILE, "data/image_index.json")
-            if include.get("accounts_snapshot"):
-                self._add_bytes_to_archive(
-                    archive,
-                    "snapshots/accounts.json",
-                    _json_bytes(config.get_storage_backend().load_accounts()),
-                )
-            if include.get("auth_keys_snapshot"):
-                self._add_bytes_to_archive(
-                    archive,
-                    "snapshots/auth_keys.json",
-                    _json_bytes(config.get_storage_backend().load_auth_keys()),
-                )
+            if include.get("editable_files"):
+                self._add_directory_to_archive(archive, DATA_DIR / "files", "data/files")
             if include.get("images"):
                 self._add_file_to_archive(archive, TAGS_FILE, "data/image_tags.json")
                 self._add_directory_to_archive(archive, config.images_dir, "data/images")
         return buffer.getvalue()
+
+    def _application_database_backup(self, backend: str) -> bytes:
+        if backend == "sqlite":
+            return self._sqlite_database_backup()
+        if backend == "postgresql":
+            return self._postgresql_database_backup()
+        raise BackupError(f"不支持备份数据库类型：{backend}")
+
+    def _sqlite_database_backup(self) -> bytes:
+        temporary_path = ""
+        raw_connection = self._repository.engine.raw_connection()
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False) as temporary:
+                temporary_path = temporary.name
+            destination = sqlite3.connect(temporary_path)
+            try:
+                raw_connection.driver_connection.backup(destination)
+            finally:
+                destination.close()
+            return Path(temporary_path).read_bytes()
+        except Exception as exc:
+            raise BackupError("创建 SQLite Application Database 快照失败") from exc
+        finally:
+            raw_connection.close()
+            if temporary_path:
+                Path(temporary_path).unlink(missing_ok=True)
+
+    def _postgresql_database_backup(self) -> bytes:
+        url = make_url(self._repository.database_url)
+        command = ["pg_dump", "--format=custom", "--no-owner", "--no-privileges"]
+        if url.host:
+            command.extend(["--host", url.host])
+        if url.port:
+            command.extend(["--port", str(url.port)])
+        if url.username:
+            command.extend(["--username", url.username])
+        if url.database:
+            command.extend(["--dbname", url.database])
+
+        env = dict(os.environ)
+        if url.password:
+            env["PGPASSWORD"] = url.password
+        sslmode = str(url.query.get("sslmode") or "").strip()
+        if sslmode:
+            env["PGSSLMODE"] = sslmode
+        try:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+                env=env,
+            )
+        except FileNotFoundError as exc:
+            raise BackupError("当前环境缺少 pg_dump，无法备份 PostgreSQL") from exc
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
+            raise BackupError(f"PostgreSQL 备份失败：{detail or 'pg_dump 执行失败'}") from exc
+        if not result.stdout:
+            raise BackupError("PostgreSQL 备份失败：pg_dump 未输出数据")
+        return result.stdout
 
     def _add_bytes_to_archive(self, archive: tarfile.TarFile, name: str, payload: bytes) -> None:
         info = tarfile.TarInfo(name=name)

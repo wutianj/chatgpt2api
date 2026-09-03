@@ -31,10 +31,26 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         base_url=base_url,
         message_as_error=True,
         progress_callback=progress_callback,
+        call_id=str(body.get("_call_id") or ""),
+        trace_image_perf=bool(body.get("_trace_image_perf")),
     ))
     if body.get("stream"):
-        return stream_image_chunks(outputs)
-    result = collect_image_outputs(outputs)
+        input_text_tokens = count_text_tokens(prompt, model)
+        return stream_image_chunks(
+            outputs,
+            event_prefix="image_generation",
+            partial_images=body.get("partial_images"),
+            resolution_callback=body.get("_billing_resolution_callback"),
+            usage_builder=lambda data: image_usage(
+                input_text_tokens=input_text_tokens,
+                output_tokens=count_image_output_items_tokens(data, size, quality),
+            ),
+        )
+    result = collect_image_outputs(
+        outputs,
+        result_callback=body.get("_image_result_callback"),
+        resolution_callback=body.get("_billing_resolution_callback"),
+    )
     result["usage"] = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),
         output_tokens=count_image_output_items_tokens(result.get("data"), size, quality),

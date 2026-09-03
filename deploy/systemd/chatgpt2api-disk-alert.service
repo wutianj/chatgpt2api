@@ -1,0 +1,9 @@
+[Unit]
+Description=Check chatgpt2api disk usage
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/opt/chatgpt2api/.env
+Environment=APP_DIR=/opt/chatgpt2api
+Environment=DISK_ALERT_THRESHOLD_PERCENT=80
+ExecStart=/opt/chatgpt2api/deploy/disk-alert.sh

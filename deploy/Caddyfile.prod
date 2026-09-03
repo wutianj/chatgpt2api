@@ -1,0 +1,44 @@
+# Unified public entry for the user portal and admin console.
+gptapi.n9k2m.shop {
+    encode gzip zstd
+    reverse_proxy 127.0.0.1:3000
+}
+
+# Alternate entry point; keep the original hostname canonical.
+i7.n9k2m.shop {
+    redir https://gptapi.n9k2m.shop{uri} 308
+}
+
+# Keep the existing infinite-canvas build online as the unified portal's
+# authenticated canvas surface. The portal supplies baseUrl and a short-lived
+# canvas:ai token through the query string.
+canvas.n9k2m.shop {
+    encode gzip zstd
+    header /config.js Cache-Control "no-store"
+
+    @legacy_image path /image /image/*
+    redir @legacy_image https://gptapi.n9k2m.shop/image 301
+
+    handle_path /prompt-assets/gpt-image-2/* {
+        rewrite * /freestylefly/awesome-gpt-image-2/main/data/images{path}
+        reverse_proxy https://raw.githubusercontent.com {
+            header_up Host raw.githubusercontent.com
+            header_down -Source-Age
+            header_down -Via
+            header_down -X-Cache
+            header_down -X-Cache-Hits
+            header_down -X-Fastly-Request-Id
+            header_down -X-GitHub-Edge-Region
+            header_down -X-GitHub-Request-Id
+            header_down -X-GitHub-Request-Url
+            header_down -X-Served-By
+            header_down -X-Timer
+        }
+    }
+
+    handle {
+        root * /opt/infinite-canvas/dist
+        try_files {path} /index.html
+        file_server
+    }
+}

@@ -1,31 +1,45 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
-import json
 import os
-import sys
+import re
+import threading
+from time import monotonic
 from pathlib import Path
-import time
+from urllib.parse import urlsplit, urlunsplit
 
+from contracts.settings_specification import (
+    normalize_float_setting,
+    normalize_integer_setting,
+    numeric_setting_spec,
+)
+from services.json_file import read_json_object
 from services.storage.base import StorageBackend
+from services.storage.configuration_repository import (
+    AccountGroupRepository,
+    SystemSettingsRepository,
+    account_group_repository,
+    system_settings_repository,
+)
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 CONFIG_FILE = BASE_DIR / "config.json"
 VERSION_FILE = BASE_DIR / "VERSION"
-BACKUP_STATE_FILE = DATA_DIR / "backup_state.json"
+
+_REMOVED_TOP_LEVEL_SETTINGS = (
+    "auto_relogin_after_refresh",
+    "image_auth_refresh_concurrency",
+    "image_preflight_token_refresh_enabled",
+)
 
 DEFAULT_BACKUP_INCLUDE = {
-    "config": True,
-    "cpa": True,
-    "sub2api": True,
-    "logs": True,
     "image_tasks": True,
-    "accounts_snapshot": True,
-    "auth_keys_snapshot": True,
+    "editable_files": True,
     "images": False,
 }
+
+_DATABASE_SETTINGS_REFRESH_INTERVAL_SECONDS = 1.0
 
 DEFAULT_IMAGE_STORAGE = {
     "enabled": False,
@@ -35,6 +49,39 @@ DEFAULT_IMAGE_STORAGE = {
     "webdav_password": "",
     "webdav_root_path": "chatgpt2api/images",
     "public_base_url": "",
+}
+
+DEFAULT_GENBOX_PUSH = {
+    "enabled": False,
+    "base_url": "",
+    "source_id": "",
+    "push_key": "",
+    "timeout_secs": 20,
+    "auto_push_after_studio": False,
+}
+
+DEFAULT_GEMINI_PROVIDER = {
+    "enabled": False,
+    "base_url": "",
+    "api_key": "",
+    "chat_models": [
+        "gemini-auto",
+        "gemini-2.5-pro",
+        "gemini-3.5-flash",
+        "gemini-3.1-pro-preview",
+    ],
+    "image_models": ["gemini-imagen"],
+    "timeout_secs": 180,
+}
+
+DEFAULT_PORTAL_BILLING = {
+    "chat_cost_units": 1,
+    "image_1k_cost_units": 10,
+    "image_2k_cost_units": 20,
+    "image_4k_cost_units": 40,
+    "image_4k_enabled": False,
+    "search_cost_units": 2,
+    "file_cost_units": 20,
 }
 
 DEFAULT_CHAT_COMPLETION_CACHE = {
@@ -56,8 +103,6 @@ DEFAULT_PROXY_RUNTIME_USER_AGENT = (
 
 DEFAULT_PROXY_RUNTIME = {
     "enabled": False,
-    "egress_mode": "direct",
-    "proxy_url": "",
     "resource_proxy_url": "",
     "skip_ssl_verify": False,
     "reset_session_status_codes": [403],
@@ -69,8 +114,10 @@ DEFAULT_PROXY_RUNTIME = {
         "user_agent": DEFAULT_PROXY_RUNTIME_USER_AGENT,
         "browser": "chrome",
         "flaresolverr_url": "",
-        "timeout_sec": 60,
-        "refresh_interval": 3600,
+        "timeout_sec": int(numeric_setting_spec("proxy_runtime.clearance.timeout_sec").default),
+        "refresh_interval": int(
+            numeric_setting_spec("proxy_runtime.clearance.refresh_interval").default
+        ),
         "warm_up_on_start": False,
     },
 }
@@ -104,17 +151,21 @@ def _normalize_positive_int(value: object, default: int, minimum: int = 0) -> in
     return max(minimum, normalized)
 
 
-def _normalize_backup_include(value: object) -> dict[str, bool]:
+def _normalize_backup_include(value: object) -> dict[str, object]:
     source = value if isinstance(value, dict) else {}
-    normalized = dict(DEFAULT_BACKUP_INCLUDE)
-    for key in normalized:
-        normalized[key] = _normalize_bool(source.get(key), normalized[key])
+    normalized = copy.deepcopy(source)
+    normalized.pop("register", None)
+    for key, default in DEFAULT_BACKUP_INCLUDE.items():
+        normalized[key] = _normalize_bool(source.get(key), default)
     return normalized
 
 
 def _normalize_backup_settings(value: object) -> dict[str, object]:
     source = value if isinstance(value, dict) else {}
-    return {
+    normalized = copy.deepcopy(source)
+    normalized.pop("has_secret_access_key", None)
+    normalized.pop("has_passphrase", None)
+    normalized.update({
         "enabled": _normalize_bool(source.get("enabled"), False),
         "provider": "cloudflare_r2",
         "account_id": str(source.get("account_id") or "").strip(),
@@ -122,23 +173,19 @@ def _normalize_backup_settings(value: object) -> dict[str, object]:
         "secret_access_key": str(source.get("secret_access_key") or "").strip(),
         "bucket": str(source.get("bucket") or "").strip(),
         "prefix": str(source.get("prefix") or "backups").strip().strip("/") or "backups",
-        "interval_minutes": _normalize_positive_int(source.get("interval_minutes"), 360, 1),
-        "rotation_keep": _normalize_positive_int(source.get("rotation_keep"), 10, 0),
+        "interval_minutes": normalize_integer_setting(
+            "backup.interval_minutes",
+            source.get("interval_minutes"),
+        ),
+        "rotation_keep": normalize_integer_setting(
+            "backup.rotation_keep",
+            source.get("rotation_keep"),
+        ),
         "encrypt": _normalize_bool(source.get("encrypt"), False),
         "passphrase": str(source.get("passphrase") or "").strip(),
         "include": _normalize_backup_include(source.get("include")),
-    }
-
-
-def _normalize_backup_state(value: object) -> dict[str, object]:
-    source = value if isinstance(value, dict) else {}
-    return {
-        "last_started_at": str(source.get("last_started_at") or "").strip() or None,
-        "last_finished_at": str(source.get("last_finished_at") or "").strip() or None,
-        "last_status": str(source.get("last_status") or "idle").strip() or "idle",
-        "last_error": str(source.get("last_error") or "").strip() or None,
-        "last_object_key": str(source.get("last_object_key") or "").strip() or None,
-    }
+    })
+    return normalized
 
 
 def _normalize_image_storage_settings(value: object) -> dict[str, object]:
@@ -150,7 +197,9 @@ def _normalize_image_storage_settings(value: object) -> dict[str, object]:
     if not enabled:
         mode = "local"
     root_path = str(source.get("webdav_root_path") or DEFAULT_IMAGE_STORAGE["webdav_root_path"]).strip().strip("/")
-    return {
+    normalized = copy.deepcopy(source)
+    normalized.pop("has_webdav_password", None)
+    normalized.update({
         "enabled": enabled,
         "mode": mode,
         "webdav_url": str(source.get("webdav_url") or "").strip().rstrip("/"),
@@ -158,6 +207,107 @@ def _normalize_image_storage_settings(value: object) -> dict[str, object]:
         "webdav_password": str(source.get("webdav_password") or "").strip(),
         "webdav_root_path": root_path or str(DEFAULT_IMAGE_STORAGE["webdav_root_path"]),
         "public_base_url": str(source.get("public_base_url") or "").strip().rstrip("/"),
+    })
+    return normalized
+
+
+def _normalize_genbox_base_url(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return ""
+    if parsed.path.rstrip("/") not in {"", "/api/sync/push"}:
+        return ""
+    return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+
+
+def _normalize_genbox_push_settings(value: object) -> dict[str, object]:
+    source = value if isinstance(value, dict) else {}
+    try:
+        timeout = int(source.get("timeout_secs") or DEFAULT_GENBOX_PUSH["timeout_secs"])
+    except (TypeError, ValueError):
+        timeout = int(DEFAULT_GENBOX_PUSH["timeout_secs"])
+    normalized = copy.deepcopy(source)
+    normalized.pop("has_push_key", None)
+    normalized.pop("clear_push_key", None)
+    normalized.update({
+        "enabled": _normalize_bool(source.get("enabled"), False),
+        "base_url": _normalize_genbox_base_url(source.get("base_url")),
+        "source_id": str(source.get("source_id") or "").strip(),
+        "push_key": str(source.get("push_key") or "").strip(),
+        "timeout_secs": max(5, min(120, timeout)),
+        "auto_push_after_studio": _normalize_bool(source.get("auto_push_after_studio"), False),
+    })
+    return normalized
+
+
+def _normalize_gemini_base_url(value: object) -> str:
+    raw = str(value or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return ""
+    path = parsed.path.rstrip("/")
+    if path not in {"", "/v1"}:
+        return ""
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def _normalize_string_list(value: object, default: list[str]) -> list[str]:
+    source = value if isinstance(value, list) else default
+    values: list[str] = []
+    for item in source:
+        normalized = str(item or "").strip()
+        if normalized and normalized not in values:
+            values.append(normalized)
+    return values
+
+
+def _normalize_gemini_provider_settings(value: object) -> dict[str, object]:
+    source = value if isinstance(value, dict) else {}
+    try:
+        timeout_secs = int(source.get("timeout_secs") or DEFAULT_GEMINI_PROVIDER["timeout_secs"])
+    except (TypeError, ValueError):
+        timeout_secs = int(DEFAULT_GEMINI_PROVIDER["timeout_secs"])
+    normalized = copy.deepcopy(source)
+    normalized.pop("has_api_key", None)
+    normalized.update({
+        "enabled": _normalize_bool(source.get("enabled"), False),
+        "base_url": _normalize_gemini_base_url(source.get("base_url")),
+        "api_key": str(source.get("api_key") or "").strip(),
+        "chat_models": _normalize_string_list(
+            source.get("chat_models"),
+            list(DEFAULT_GEMINI_PROVIDER["chat_models"]),
+        ),
+        "image_models": _normalize_string_list(
+            source.get("image_models"),
+            list(DEFAULT_GEMINI_PROVIDER["image_models"]),
+        ),
+        "timeout_secs": max(5, min(600, timeout_secs)),
+    })
+    return normalized
+
+
+def _normalize_portal_billing_settings(value: object) -> dict[str, object]:
+    source = value if isinstance(value, dict) else {}
+    return {
+        key: _normalize_positive_int(source.get(key), int(default), 1)
+        if key != "image_4k_enabled"
+        else _normalize_bool(source.get(key), bool(default))
+        for key, default in DEFAULT_PORTAL_BILLING.items()
     }
 
 
@@ -220,10 +370,6 @@ def _normalize_proxy_runtime_settings(value: object) -> dict[str, object]:
     default_clearance = DEFAULT_PROXY_RUNTIME["clearance"]
     clearance_source = source.get("clearance") if isinstance(source.get("clearance"), dict) else {}
 
-    egress_mode = str(source.get("egress_mode") or DEFAULT_PROXY_RUNTIME["egress_mode"]).strip().lower()
-    if egress_mode not in {"direct", "single_proxy"}:
-        egress_mode = str(DEFAULT_PROXY_RUNTIME["egress_mode"])
-
     clearance_mode = str(clearance_source.get("mode") or default_clearance["mode"]).strip().lower()
     if clearance_mode not in {"none", "manual", "flaresolverr"}:
         clearance_mode = str(default_clearance["mode"])
@@ -240,51 +386,94 @@ def _normalize_proxy_runtime_settings(value: object) -> dict[str, object]:
     if not cf_clearance and _normalize_bool(clearance_source.get("has_cf_clearance"), False):
         cf_clearance = existing_cf_clearance
 
-    return {
+    normalized_clearance = copy.deepcopy(clearance_source)
+    normalized_clearance.pop("has_cf_cookies", None)
+    normalized_clearance.pop("has_cf_clearance", None)
+    normalized_clearance.update({
+        "enabled": _normalize_bool(clearance_source.get("enabled"), bool(default_clearance["enabled"])),
+        "mode": clearance_mode,
+        "cf_cookies": cf_cookies,
+        "cf_clearance": cf_clearance,
+        "user_agent": user_agent or str(default_clearance["user_agent"]),
+        "browser": browser or str(default_clearance["browser"]),
+        "flaresolverr_url": str(clearance_source.get("flaresolverr_url") or "").strip(),
+        "timeout_sec": normalize_integer_setting(
+            "proxy_runtime.clearance.timeout_sec",
+            clearance_source.get("timeout_sec"),
+        ),
+        "refresh_interval": normalize_integer_setting(
+            "proxy_runtime.clearance.refresh_interval",
+            clearance_source.get("refresh_interval"),
+        ),
+        "warm_up_on_start": _normalize_bool(
+            clearance_source.get("warm_up_on_start"),
+            bool(default_clearance["warm_up_on_start"]),
+        ),
+    })
+
+    normalized = copy.deepcopy(source)
+    normalized.pop("_existing_cf_cookies", None)
+    normalized.pop("_existing_cf_clearance", None)
+    normalized.pop("egress_mode", None)
+    normalized.pop("proxy_url", None)
+    normalized.update({
         "enabled": _normalize_bool(source.get("enabled"), bool(DEFAULT_PROXY_RUNTIME["enabled"])),
-        "egress_mode": egress_mode,
-        "proxy_url": str(source.get("proxy_url") or "").strip(),
         "resource_proxy_url": str(source.get("resource_proxy_url") or "").strip(),
         "skip_ssl_verify": _normalize_bool(
             source.get("skip_ssl_verify"),
             bool(DEFAULT_PROXY_RUNTIME["skip_ssl_verify"]),
         ),
         "reset_session_status_codes": _normalize_status_codes(source.get("reset_session_status_codes")),
-        "clearance": {
-            "enabled": _normalize_bool(clearance_source.get("enabled"), bool(default_clearance["enabled"])),
-            "mode": clearance_mode,
-            "cf_cookies": cf_cookies,
-            "cf_clearance": cf_clearance,
-            "user_agent": user_agent or str(default_clearance["user_agent"]),
-            "browser": browser or str(default_clearance["browser"]),
-            "flaresolverr_url": str(clearance_source.get("flaresolverr_url") or "").strip(),
-            "timeout_sec": _normalize_positive_int(
-                clearance_source.get("timeout_sec"),
-                int(default_clearance["timeout_sec"]),
-                1,
-            ),
-            "refresh_interval": _normalize_positive_int(
-                clearance_source.get("refresh_interval"),
-                int(default_clearance["refresh_interval"]),
-                60,
-            ),
-            "warm_up_on_start": _normalize_bool(
-                clearance_source.get("warm_up_on_start"),
-                bool(default_clearance["warm_up_on_start"]),
-            ),
-        },
-    }
+        "clearance": normalized_clearance,
+    })
+    return normalized
 
 
 def _normalize_third_party_apps_settings(value: object) -> dict[str, object]:
     source = value if isinstance(value, dict) else {}
     canvas_source = source.get("infinite_canvas") if isinstance(source.get("infinite_canvas"), dict) else {}
-    return {
-        "infinite_canvas": {
-            "enabled": _normalize_bool(canvas_source.get("enabled"), False),
-            "url": str(canvas_source.get("url") or DEFAULT_THIRD_PARTY_APPS["infinite_canvas"]["url"]).strip(),
-        },
-    }
+    normalized_canvas = copy.deepcopy(canvas_source)
+    normalized_canvas.update({
+        "enabled": _normalize_bool(canvas_source.get("enabled"), False),
+        "url": str(canvas_source.get("url") or DEFAULT_THIRD_PARTY_APPS["infinite_canvas"]["url"]).strip(),
+    })
+    normalized = copy.deepcopy(source)
+    normalized["infinite_canvas"] = normalized_canvas
+    return normalized
+
+
+def _legacy_basic_from_settings(value: object, settings: dict[str, object]) -> dict[str, object]:
+    source = dict(value) if isinstance(value, dict) else {}
+    source["proxy"] = str(settings.get("proxy") or "").strip()
+    source["base_url"] = str(settings.get("base_url") or "").strip().rstrip("/")
+    retention_hours = normalize_integer_setting(
+        "image_retention_hours",
+        settings.get("image_retention_hours"),
+    )
+    source["image_expire_hours"] = retention_hours
+    return source
+
+
+def _promote_legacy_basic_settings(data: dict[str, object]) -> dict[str, object]:
+    next_data = dict(data or {})
+    for key in _REMOVED_TOP_LEVEL_SETTINGS:
+        next_data.pop(key, None)
+    basic = next_data.get("basic")
+    if not isinstance(basic, dict):
+        return next_data
+    if "proxy" not in next_data and "proxy" in basic:
+        next_data["proxy"] = str(basic.get("proxy") or "").strip()
+    if "base_url" not in next_data and "base_url" in basic:
+        next_data["base_url"] = str(basic.get("base_url") or "").strip().rstrip("/")
+    if "image_retention_hours" not in next_data and "image_expire_hours" in basic:
+        try:
+            legacy_hours = max(1, int(basic.get("image_expire_hours") or 24))
+            next_data["image_retention_hours"] = legacy_hours
+        except (TypeError, ValueError):
+            next_data["image_retention_hours"] = int(
+                numeric_setting_spec("image_retention_hours").default
+            )
+    return next_data
 
 
 def _validate_image_storage_settings(settings: dict[str, object]) -> None:
@@ -296,10 +485,15 @@ def _validate_image_storage_settings(settings: dict[str, object]) -> None:
         raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV 密码")
 
 
-@dataclass(frozen=True)
-class LoadedSettings:
-    auth_key: str
-    refresh_account_interval_minute: int
+def _validate_genbox_push_settings(settings: dict[str, object]) -> None:
+    if not _normalize_bool(settings.get("enabled"), False):
+        return
+    if not _normalize_genbox_base_url(settings.get("base_url")):
+        raise ValueError("启用 GenBox Push 后必须填写有效的 HTTP(S) 地址")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", str(settings.get("source_id") or "").strip()):
+        raise ValueError("GenBox 来源 ID 格式无效")
+    if not str(settings.get("push_key") or "").strip():
+        raise ValueError("启用 GenBox Push 后必须填写 Push Key")
 
 
 def _normalize_auth_key(value: object) -> str:
@@ -310,48 +504,21 @@ def _is_invalid_auth_key(value: object) -> bool:
     return _normalize_auth_key(value) == ""
 
 
-def _read_json_object(path: Path, *, name: str) -> dict[str, object]:
-    if not path.exists():
-        return {}
-    if path.is_dir():
-        print(
-            f"Warning: {name} at '{path}' is a directory, ignoring it and falling back to other configuration sources.",
-            file=sys.stderr,
-        )
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _load_settings() -> LoadedSettings:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    raw_config = _read_json_object(CONFIG_FILE, name="config.json")
-    auth_key = _normalize_auth_key(os.getenv("CHATGPT2API_AUTH_KEY") or raw_config.get("auth-key"))
-    if _is_invalid_auth_key(auth_key):
-        raise ValueError(
-            "❌ auth-key 未设置！\n"
-            "请在环境变量 CHATGPT2API_AUTH_KEY 中设置，或者在 config.json 中填写 auth-key。"
-        )
-
-    try:
-        refresh_interval = int(raw_config.get("refresh_account_interval_minute", 5))
-    except (TypeError, ValueError):
-        refresh_interval = 5
-
-    return LoadedSettings(
-        auth_key=auth_key,
-        refresh_account_interval_minute=refresh_interval,
-    )
-
-
 class ConfigStore:
-    def __init__(self, path: Path):
+    def __init__(
+        self,
+        path: Path,
+        *,
+        settings_repository: SystemSettingsRepository | None = None,
+        groups_repository: AccountGroupRepository | None = None,
+    ):
         self.path = path
+        self._lock = threading.RLock()
         DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self._settings_repository = settings_repository or system_settings_repository
+        self._groups_repository = groups_repository or account_group_repository
         self.data = self._load()
+        self._last_repository_refresh_at = monotonic()
         self._storage_backend: StorageBackend | None = None
         if _is_invalid_auth_key(self.auth_key):
             raise ValueError(
@@ -363,64 +530,153 @@ class ConfigStore:
                 '   "auth-key": "your_real_auth_key"'
             )
 
-    def _load(self) -> dict[str, object]:
-        return _read_json_object(self.path, name="config.json")
+    @property
+    def mutation_lock(self) -> threading.RLock:
+        return self._lock
 
-    def _save(self) -> None:
-        self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    def _load(self) -> dict[str, object]:
+        settings = _promote_legacy_basic_settings(self._settings_repository.get())
+        groups = self._groups_repository.get().get("items")
+        settings["account_groups"] = (
+            copy.deepcopy(groups) if isinstance(groups, list) else []
+        )
+        return settings
+
+    def reload_if_changed(self) -> None:
+        with self._lock:
+            now = monotonic()
+            if (
+                now - self._last_repository_refresh_at
+                < _DATABASE_SETTINGS_REFRESH_INTERVAL_SECONDS
+            ):
+                return
+            self.data = self._load()
+            self._last_repository_refresh_at = now
 
     @property
     def auth_key(self) -> str:
-        return _normalize_auth_key(os.getenv("CHATGPT2API_AUTH_KEY") or self.data.get("auth-key"))
-
-    @property
-    def accounts_file(self) -> Path:
-        return DATA_DIR / "accounts.json"
+        bootstrap = read_json_object(self.path, name="config.json")
+        return _normalize_auth_key(
+            os.getenv("CHATGPT2API_AUTH_KEY") or bootstrap.get("auth-key")
+        )
 
     @property
     def refresh_account_interval_minute(self) -> int:
-        try:
-            return int(self.data.get("refresh_account_interval_minute", 5))
-        except (TypeError, ValueError):
-            return 5
+        self.reload_if_changed()
+        return normalize_integer_setting(
+            "refresh_account_interval_minute",
+            self.data.get("refresh_account_interval_minute"),
+        )
 
     @property
-    def image_retention_days(self) -> int:
-        try:
-            return max(1, int(self.data.get("image_retention_days", 30)))
-        except (TypeError, ValueError):
-            return 30
+    def image_retention_hours(self) -> int:
+        return normalize_integer_setting(
+            "image_retention_hours",
+            self.data.get("image_retention_hours"),
+        )
+
+    @property
+    def log_retention_hours(self) -> int:
+        return normalize_integer_setting(
+            "log_retention_hours",
+            self.data.get("log_retention_hours"),
+        )
+
+    @property
+    def image_min_free_mb(self) -> int:
+        self.reload_if_changed()
+        return _normalize_positive_int(
+            self.data.get("image_min_free_mb") or 500,
+            500,
+            1,
+        )
+
+    @property
+    def console_request_timeout_secs(self) -> int:
+        self.reload_if_changed()
+        return normalize_integer_setting(
+            "console_request_timeout_secs",
+            self.data.get("console_request_timeout_secs"),
+        )
 
     @property
     def image_poll_timeout_secs(self) -> int:
-        try:
-            return max(1, int(self.data.get("image_poll_timeout_secs", 120)))
-        except (TypeError, ValueError):
-            return 120
+        self.reload_if_changed()
+        return normalize_integer_setting(
+            "image_poll_timeout_secs",
+            self.data.get("image_poll_timeout_secs"),
+        )
+
+    @property
+    def image_stream_timeout_secs(self) -> int:
+        self.reload_if_changed()
+        return normalize_integer_setting(
+            "image_stream_timeout_secs",
+            self.data.get("image_stream_timeout_secs"),
+        )
+
+    @property
+    def image_request_timeout_secs(self) -> int:
+        """Hard lifecycle deadline derived from the two user-facing image timeouts."""
+        return self.image_stream_timeout_secs + self.image_poll_timeout_secs + 30
 
     @property
     def image_poll_interval_secs(self) -> float:
-        try:
-            return max(0.5, float(self.data.get("image_poll_interval_secs", 10.0)))
-        except (TypeError, ValueError):
-            return 10.0
+        self.reload_if_changed()
+        return normalize_float_setting(
+            "image_poll_interval_secs",
+            self.data.get("image_poll_interval_secs"),
+        )
 
     @property
     def image_poll_initial_wait_secs(self) -> float:
         """Image generation upstream takes ~30s; polling immediately wastes requests
-        and trips a transient 429. Default 10s gives the conversation document time
+        and trips a transient 429. Default 5s gives the conversation document time
         to commit before the first poll."""
-        try:
-            return max(0.0, float(self.data.get("image_poll_initial_wait_secs", 10.0)))
-        except (TypeError, ValueError):
-            return 10.0
+        self.reload_if_changed()
+        return normalize_float_setting(
+            "image_poll_initial_wait_secs",
+            self.data.get("image_poll_initial_wait_secs"),
+        )
 
     @property
     def image_account_concurrency(self) -> int:
-        try:
-            return max(1, int(self.data.get("image_account_concurrency", 3)))
-        except (TypeError, ValueError):
-            return 3
+        return normalize_integer_setting(
+            "image_account_concurrency",
+            self.data.get("image_account_concurrency"),
+        )
+
+    @property
+    def image_account_retry_enabled(self) -> bool:
+        self.reload_if_changed()
+        return _normalize_bool(self.data.get("image_account_retry_enabled"), True)
+
+    @property
+    def image_upscale_enabled(self) -> bool:
+        self.reload_if_changed()
+        return _normalize_bool(self.data.get("image_upscale_enabled"), False)
+
+    @property
+    def image_upscale_engine(self) -> str:
+        self.reload_if_changed()
+        value = str(self.data.get("image_upscale_engine") or "sharp_lanczos3").strip().lower()
+        return value if value in {"sharp_lanczos3", "pillow_lanczos"} else "sharp_lanczos3"
+
+    @property
+    def account_processing_concurrency(self) -> int:
+        self.reload_if_changed()
+        return normalize_integer_setting(
+            "account_processing_concurrency",
+            self.data.get("account_processing_concurrency"),
+        )
+
+    @property
+    def image_max_account_attempts(self) -> int:
+        self.reload_if_changed()
+        return normalize_integer_setting(
+            "image_max_account_attempts",
+            self.data.get("image_max_account_attempts"),
+        )
 
     @property
     def image_parallel_generation(self) -> bool:
@@ -428,6 +684,11 @@ class ConfigStore:
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
+
+    @property
+    def image_remove_conversation_after_result(self) -> bool:
+        self.reload_if_changed()
+        return _normalize_bool(self.data.get("image_remove_conversation_after_result"), False)
 
     @property
     def image_settle_enabled(self) -> bool:
@@ -446,29 +707,16 @@ class ConfigStore:
         return bool(value)
 
     @property
-    def image_remove_conversation_after_result(self) -> bool:
-        """出图成功后异步隐藏 ChatGPT 本地对话记录。"""
-        value = self.data.get("image_remove_conversation_after_result", False)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(value)
-
-    @property
-    def image_remove_conversation_always(self) -> bool:
-        """无论是否出图，画图请求结束后都异步隐藏 ChatGPT 本地对话记录。"""
-        return _normalize_bool(self.data.get("image_remove_conversation_always"), False)
-
-    @property
     def image_settle_secs(self) -> float:
         """二次确认等待时间（秒）。"""
-        try:
-            return max(0.5, float(self.data.get("image_settle_secs", 2.0)))
-        except (TypeError, ValueError):
-            return 2.0
+        return normalize_float_setting(
+            "image_settle_secs",
+            self.data.get("image_settle_secs"),
+        )
 
     @property
     def auto_remove_invalid_accounts(self) -> bool:
-        value = self.data.get("auto_remove_invalid_accounts", False)
+        value = self.data.get("auto_remove_invalid_accounts", True)
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
@@ -476,13 +724,6 @@ class ConfigStore:
     @property
     def auto_remove_rate_limited_accounts(self) -> bool:
         value = self.data.get("auto_remove_rate_limited_accounts", False)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(value)
-
-    @property
-    def auto_relogin_after_refresh(self) -> bool:
-        value = self.data.get("auto_relogin_after_refresh", False)
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
@@ -510,15 +751,6 @@ class ConfigStore:
         return str(self.data.get("global_system_prompt") or "").strip()
 
     @property
-    def default_upstream_model_name(self) -> str:
-        return str(self.data.get("default_upstream_model_name") or "gpt-5-5").strip()
-
-    @property
-    def default_thinking_effort(self) -> str:
-        value = str(self.data.get("default_thinking_effort") or "auto").strip().lower()
-        return value if value in {"auto", "standard", "extended", "max"} else "auto"
-
-    @property
     def images_dir(self) -> Path:
         path = DATA_DIR / "images"
         path.mkdir(parents=True, exist_ok=True)
@@ -529,20 +761,6 @@ class ConfigStore:
         path = DATA_DIR / "image_thumbnails"
         path.mkdir(parents=True, exist_ok=True)
         return path
-
-    def cleanup_old_images(self) -> int:
-        cutoff = time.time() - self.image_retention_days * 86400
-        removed = 0
-        for path in self.images_dir.rglob("*"):
-            if path.is_file() and path.stat().st_mtime < cutoff:
-                path.unlink()
-                removed += 1
-        for path in sorted((p for p in self.images_dir.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
-            try:
-                path.rmdir()
-            except OSError:
-                pass
-        return removed
 
     @property
     def base_url(self) -> str:
@@ -561,80 +779,151 @@ class ConfigStore:
         return value or "0.0.0"
 
     def get(self) -> dict[str, object]:
-        data = dict(self.data)
-        data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
-        data["image_retention_days"] = self.image_retention_days
-        data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
-        data["image_poll_interval_secs"] = self.image_poll_interval_secs
-        data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
-        data["image_account_concurrency"] = self.image_account_concurrency
-        data["image_parallel_generation"] = self.image_parallel_generation
-        data["image_remove_conversation_after_result"] = self.image_remove_conversation_after_result
-        data["image_remove_conversation_always"] = self.image_remove_conversation_always
-        data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
-        data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts
-        data["auto_relogin_after_refresh"] = self.auto_relogin_after_refresh
-        data["log_levels"] = self.log_levels
-        data["sensitive_words"] = self.sensitive_words
-        data["ai_review"] = self.ai_review
-        data["global_system_prompt"] = self.global_system_prompt
-        data["default_upstream_model_name"] = self.default_upstream_model_name
-        data["default_thinking_effort"] = self.default_thinking_effort
-        data["backup"] = self.get_backup_settings()
-        data["image_storage"] = self.get_image_storage_settings()
-        data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
-        data["proxy_runtime"] = self.get_public_proxy_runtime_settings()
-        data["third_party_apps"] = self.get_third_party_apps_settings()
-        data.pop("auth-key", None)
-        return data
+        with self._lock:
+            self.reload_if_changed()
+            data = dict(self.data)
+            data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
+            data["image_retention_hours"] = self.image_retention_hours
+            data["log_retention_hours"] = self.log_retention_hours
+            data["image_min_free_mb"] = self.image_min_free_mb
+            data["console_request_timeout_secs"] = self.console_request_timeout_secs
+            data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
+            data["image_stream_timeout_secs"] = self.image_stream_timeout_secs
+            data["image_poll_interval_secs"] = self.image_poll_interval_secs
+            data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
+            data["image_account_concurrency"] = self.image_account_concurrency
+            data["account_processing_concurrency"] = self.account_processing_concurrency
+            data["image_account_retry_enabled"] = self.image_account_retry_enabled
+            data["image_upscale_enabled"] = self.image_upscale_enabled
+            data["image_upscale_engine"] = self.image_upscale_engine
+            data["image_max_account_attempts"] = self.image_max_account_attempts
+            data["image_parallel_generation"] = self.image_parallel_generation
+            data["image_remove_conversation_after_result"] = self.image_remove_conversation_after_result
+            data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
+            data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts
+            data["log_levels"] = self.log_levels
+            data["sensitive_words"] = self.sensitive_words
+            data["ai_review"] = self.ai_review
+            data["global_system_prompt"] = self.global_system_prompt
+            data["backup"] = self.get_backup_settings()
+            data["image_storage"] = self.get_image_storage_settings()
+            data["genbox_push"] = self.get_genbox_push_settings()
+            data["portal_billing"] = self.get_portal_billing_settings()
+            data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
+            data["proxy_runtime"] = self.get_public_proxy_runtime_settings()
+            data["fallback_proxy"] = self.get_proxy_fallback_settings()
+            data["third_party_apps"] = self.get_third_party_apps_settings()
+            data["gemini_provider"] = self.get_gemini_provider_settings()
+            data.pop("basic", None)
+            return data
 
     def get_proxy_settings(self) -> str:
-        return str(self.data.get("proxy") or "").strip()
+        return ""
+
+    def get_proxy_fallback_settings(self) -> str:
+        return ""
 
     def get_proxy_runtime_settings(self) -> dict[str, object]:
         return _normalize_proxy_runtime_settings(self.data.get("proxy_runtime"))
 
     def get_public_proxy_runtime_settings(self) -> dict[str, object]:
-        runtime = copy.deepcopy(self.get_proxy_runtime_settings())
+        runtime = self.get_proxy_runtime_settings()
         clearance = runtime.get("clearance") if isinstance(runtime.get("clearance"), dict) else {}
-        if isinstance(clearance, dict):
-            cf_cookies = str(clearance.get("cf_cookies") or "").strip()
-            cf_clearance = str(clearance.get("cf_clearance") or "").strip()
-            clearance["cf_cookies"] = ""
-            clearance["cf_clearance"] = ""
-            clearance["has_cf_cookies"] = bool(cf_cookies)
-            clearance["has_cf_clearance"] = bool(cf_clearance)
-        return runtime
+        cf_cookies = str(clearance.get("cf_cookies") or "").strip()
+        cf_clearance = str(clearance.get("cf_clearance") or "").strip()
+        public_clearance = {
+            key: copy.deepcopy(clearance.get(key))
+            for key in (
+                "enabled",
+                "mode",
+                "user_agent",
+                "browser",
+                "flaresolverr_url",
+                "timeout_sec",
+                "refresh_interval",
+                "warm_up_on_start",
+            )
+        }
+        public_clearance.update({
+            "cf_cookies": "",
+            "cf_clearance": "",
+            "has_cf_cookies": bool(cf_cookies),
+            "has_cf_clearance": bool(cf_clearance),
+        })
+        public_runtime = {
+            key: copy.deepcopy(runtime.get(key))
+            for key in (
+                "enabled",
+                "resource_proxy_url",
+                "skip_ssl_verify",
+                "reset_session_status_codes",
+            )
+        }
+        public_runtime["clearance"] = public_clearance
+        return public_runtime
 
     def get_third_party_apps_settings(self) -> dict[str, object]:
         return _normalize_third_party_apps_settings(self.data.get("third_party_apps"))
 
+    def get_gemini_provider_settings(self) -> dict[str, object]:
+        return _normalize_gemini_provider_settings(self.data.get("gemini_provider"))
+
     def update(self, data: dict[str, object]) -> dict[str, object]:
-        next_data = dict(self.data)
-        next_data.update(dict(data or {}))
-        if "backup" in next_data:
-            next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
-        if "image_storage" in next_data:
-            next_data["image_storage"] = _normalize_image_storage_settings(next_data.get("image_storage"))
-            _validate_image_storage_settings(next_data["image_storage"])
-        if "chat_completion_cache" in next_data:
-            next_data["chat_completion_cache"] = _normalize_chat_completion_cache_settings(
-                next_data.get("chat_completion_cache")
-            )
-        if "third_party_apps" in next_data:
-            next_data["third_party_apps"] = _normalize_third_party_apps_settings(next_data.get("third_party_apps"))
-        if "proxy_runtime" in next_data:
-            incoming_runtime = next_data.get("proxy_runtime")
-            if isinstance(incoming_runtime, dict):
-                previous_clearance = self.get_proxy_runtime_settings().get("clearance")
-                if isinstance(previous_clearance, dict):
-                    incoming_runtime = dict(incoming_runtime)
-                    incoming_runtime["_existing_cf_cookies"] = previous_clearance.get("cf_cookies")
-                    incoming_runtime["_existing_cf_clearance"] = previous_clearance.get("cf_clearance")
-            next_data["proxy_runtime"] = _normalize_proxy_runtime_settings(incoming_runtime)
-        next_data.pop("backup_state", None)
-        self.data = next_data
-        self._save()
+        with self._lock:
+            self.reload_if_changed()
+            updates = dict(data or {})
+            updates.pop("auth-key", None)
+            updates.pop("basic", None)
+            proxy_keys = {"proxy", "fallback_proxy", "proxy_profiles", "proxy_groups"}
+            if proxy_keys.intersection(updates):
+                raise ValueError("proxy configuration must be updated through ProxyManagementService")
+
+            group_update = updates.pop("account_groups", None)
+            if group_update is not None and updates:
+                raise ValueError("account groups and system settings have separate transaction boundaries")
+
+            if group_update is not None:
+                if not isinstance(group_update, list):
+                    raise ValueError("account_groups must be a list")
+                self._groups_repository.update({"items": copy.deepcopy(group_update)})
+                self.data = self._load()
+                self._last_repository_refresh_at = monotonic()
+                return self.get()
+
+            for key in _REMOVED_TOP_LEVEL_SETTINGS:
+                updates.pop(key, None)
+            if "backup" in updates:
+                updates["backup"] = _normalize_backup_settings(updates.get("backup"))
+            if "image_storage" in updates:
+                updates["image_storage"] = _normalize_image_storage_settings(updates.get("image_storage"))
+                _validate_image_storage_settings(updates["image_storage"])
+            if "genbox_push" in updates:
+                updates["genbox_push"] = _normalize_genbox_push_settings(updates.get("genbox_push"))
+                _validate_genbox_push_settings(updates["genbox_push"])
+            if "portal_billing" in updates:
+                updates["portal_billing"] = _normalize_portal_billing_settings(updates.get("portal_billing"))
+            if "chat_completion_cache" in updates:
+                updates["chat_completion_cache"] = _normalize_chat_completion_cache_settings(
+                    updates.get("chat_completion_cache")
+                )
+            if "third_party_apps" in updates:
+                updates["third_party_apps"] = _normalize_third_party_apps_settings(updates.get("third_party_apps"))
+            if "gemini_provider" in updates:
+                updates["gemini_provider"] = _normalize_gemini_provider_settings(updates.get("gemini_provider"))
+            if "proxy_runtime" in updates:
+                incoming_runtime = updates.get("proxy_runtime")
+                if isinstance(incoming_runtime, dict):
+                    previous_clearance = self.get_proxy_runtime_settings().get("clearance")
+                    if isinstance(previous_clearance, dict):
+                        incoming_runtime = dict(incoming_runtime)
+                        incoming_runtime["_existing_cf_cookies"] = previous_clearance.get("cf_cookies")
+                        incoming_runtime["_existing_cf_clearance"] = previous_clearance.get("cf_clearance")
+                updates["proxy_runtime"] = _normalize_proxy_runtime_settings(incoming_runtime)
+            updates.pop("backup_state", None)
+            if updates:
+                self._settings_repository.update(updates)
+            self.data = self._load()
+            self._last_repository_refresh_at = monotonic()
         return self.get()
 
     def get_backup_settings(self) -> dict[str, object]:
@@ -642,6 +931,12 @@ class ConfigStore:
 
     def get_image_storage_settings(self) -> dict[str, object]:
         return _normalize_image_storage_settings(self.data.get("image_storage"))
+
+    def get_genbox_push_settings(self) -> dict[str, object]:
+        return _normalize_genbox_push_settings(self.data.get("genbox_push"))
+
+    def get_portal_billing_settings(self) -> dict[str, object]:
+        return _normalize_portal_billing_settings(self.data.get("portal_billing"))
 
     def get_chat_completion_cache_settings(self) -> dict[str, object]:
         return _normalize_chat_completion_cache_settings(self.data.get("chat_completion_cache"))
@@ -652,16 +947,6 @@ class ConfigStore:
             from services.storage.factory import create_storage_backend
             self._storage_backend = create_storage_backend(DATA_DIR)
         return self._storage_backend
-
-
-def load_backup_state() -> dict[str, object]:
-    return _normalize_backup_state(_read_json_object(BACKUP_STATE_FILE, name="backup_state.json"))
-
-
-def save_backup_state(state: dict[str, object]) -> dict[str, object]:
-    normalized = _normalize_backup_state(state)
-    BACKUP_STATE_FILE.write_text(json.dumps(normalized, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return normalized
 
 
 config = ConfigStore(CONFIG_FILE)

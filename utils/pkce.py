@@ -12,8 +12,9 @@ def generate_pkce() -> tuple[str, str]:
     Returns:
         (code_verifier, code_challenge) 元组
     """
-    code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).rstrip(b"=").decode("ascii")
-    code_challenge = base64.urlsafe_b64encode(
-        hashlib.sha256(code_verifier.encode("ascii")).digest()
-    ).rstrip(b"=").decode("ascii")
+    # OpenAI's Codex client uses a 64-byte random value rendered as hex.
+    # Keep the challenge in the RFC 7636 base64url-without-padding format.
+    code_verifier = secrets.token_bytes(64).hex()
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    code_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
     return code_verifier, code_challenge

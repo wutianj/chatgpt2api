@@ -2,14 +2,18 @@ import base64
 import hashlib
 import json
 import mimetypes
+import queue
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from urllib.parse import urlparse
 
 from curl_cffi import requests
+from curl_cffi.requests.exceptions import RequestException
+from curl_cffi.requests.models import STREAM_END
 from fastapi import HTTPException
 from services.proxy_service import proxy_settings
 from utils.log import logger
@@ -157,11 +161,17 @@ class UpstreamHTTPError(RuntimeError):
         status_code: int,
         body: Any,
         retry_after: int | None = None,
+        credential_scope: str = "account",
     ) -> None:
         self.context = context
         self.status_code = status_code
         self.body = body
         self.retry_after = retry_after
+        self.credential_scope = (
+            credential_scope
+            if credential_scope in {"account", "signed_asset", "public"}
+            else "account"
+        )
         if isinstance(body, (dict, list)):
             try:
                 body_str = json.dumps(body, ensure_ascii=False)
@@ -174,7 +184,12 @@ class UpstreamHTTPError(RuntimeError):
         super().__init__(f"{context} failed: status={status_code}, body={body_str}")
 
 
-def ensure_ok(response: requests.Response, context: str) -> None:
+def ensure_ok(
+    response: requests.Response,
+    context: str,
+    *,
+    credential_scope: str = "account",
+) -> None:
     if 200 <= response.status_code < 300:
         return
     body: Any = response.text
@@ -188,10 +203,30 @@ def ensure_ok(response: requests.Response, context: str) -> None:
         ra_str = str(retry_after_header).strip()
         if ra_str.isdigit():
             retry_after = int(ra_str)
-    raise UpstreamHTTPError(context, response.status_code, body, retry_after=retry_after)
+    raise UpstreamHTTPError(
+        context,
+        response.status_code,
+        body,
+        retry_after=retry_after,
+        credential_scope=credential_scope,
+    )
 
 
-def sse_json_stream(items) -> Iterator[str]:
+def _stream_error_payload(
+    exc: Exception,
+    error_builder: Callable[[Exception], dict[str, Any]] | None,
+) -> dict[str, Any]:
+    if hasattr(exc, "to_openai_error"):
+        return exc.to_openai_error()
+    if error_builder is not None:
+        return error_builder(exc)
+    return {"error": {"message": str(exc), "type": exc.__class__.__name__}}
+
+
+def sse_json_stream(
+    items,
+    error_builder: Callable[[Exception], dict[str, Any]] | None = None,
+) -> Iterator[str]:
     yield ": stream-open\n\n"
     try:
         for item in items:
@@ -202,11 +237,29 @@ def sse_json_stream(items) -> Iterator[str]:
             "error_type": exc.__class__.__name__,
             "error": str(exc),
         })
-        error = exc.to_openai_error() if hasattr(exc, "to_openai_error") else {
-            "error": {"message": str(exc), "type": exc.__class__.__name__}
-        }
+        error = _stream_error_payload(exc, error_builder)
         yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
     yield "data: [DONE]\n\n"
+
+
+def image_sse_stream(
+    items,
+    error_builder: Callable[[Exception], dict[str, Any]] | None = None,
+) -> Iterator[str]:
+    try:
+        for item in items:
+            event = str(item.get("type") or "message") if isinstance(item, dict) else "message"
+            yield f"event: {event}\n"
+            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+    except Exception as exc:
+        logger.warning({
+            "event": "image_sse_stream_error",
+            "error_type": exc.__class__.__name__,
+            "error": str(exc),
+        })
+        error = _stream_error_payload(exc, error_builder)
+        yield "event: error\n"
+        yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
 
 
 def anthropic_sse_stream(items) -> Iterator[str]:
@@ -226,16 +279,155 @@ def anthropic_sse_stream(items) -> Iterator[str]:
         yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
 
 
-def iter_sse_payloads(response: requests.Response) -> Iterator[str]:
-    for raw_line in response.iter_lines():
-        if not raw_line:
-            continue
-        line = raw_line.decode("utf-8", errors="ignore") if isinstance(raw_line, bytes) else str(raw_line)
-        if not line.startswith("data:"):
-            continue
-        payload = line[5:].strip()
-        if payload:
-            yield payload
+def _format_timeout_secs(value: float) -> str:
+    if value >= 10:
+        return f"{value:.0f}s"
+    if value >= 1:
+        return f"{value:.1f}s"
+    return f"{value:.3f}s"
+
+
+def iter_sse_payloads(
+    response: requests.Response,
+    max_duration_secs: float | None = None,
+) -> Iterator[str]:
+    started_at = time.monotonic()
+    timeout_secs = float(max_duration_secs or 0)
+    pending: bytes | None = None
+    aborted = False
+
+    def _timeout_error() -> TimeoutError:
+        return TimeoutError(f"SSE stream exceeded {_format_timeout_secs(timeout_secs)}")
+
+    def _remaining_secs() -> float | None:
+        if timeout_secs <= 0:
+            return None
+        return timeout_secs - (time.monotonic() - started_at)
+
+    def _raise_if_timeout() -> None:
+        remaining = _remaining_secs()
+        if remaining is not None and remaining <= 0:
+            _abort_stream_nonblocking()
+            raise _timeout_error()
+
+    def _abort_stream_nonblocking() -> None:
+        """Cancel curl_cffi streaming without waiting for its stream task.
+
+        curl_cffi's Response.iter_content() blocks on an internal queue.get()
+        without a timeout. Calling response.close() from a watchdog can block on
+        stream_task.result(), so enforce our own deadline and only signal/close
+        the underlying curl handle here.
+        """
+        nonlocal aborted
+        aborted = True
+        try:
+            if getattr(response, "quit_now", None):
+                response.quit_now.set()
+        except Exception:
+            pass
+        try:
+            if getattr(response, "curl", None):
+                response.curl.close()
+        except Exception:
+            pass
+        try:
+            response._stream_closed = True
+        except Exception:
+            pass
+
+    def _iter_chunks() -> Iterator[bytes]:
+        stream_queue = getattr(response, "queue", None)
+        if stream_queue is None:
+            yield from _iter_response_content_with_deadline()
+            return
+        while True:
+            _raise_if_timeout()
+            remaining = _remaining_secs()
+            wait_secs = 1.0 if remaining is None else max(0.001, min(1.0, remaining))
+            try:
+                chunk = stream_queue.get(timeout=wait_secs)
+            except queue.Empty:
+                _raise_if_timeout()
+                continue
+            if isinstance(chunk, RequestException):
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                raise chunk
+            if chunk is STREAM_END:
+                break
+            yield chunk
+
+    def _iter_response_content_with_deadline() -> Iterator[bytes]:
+        """Iterate response.iter_content() without letting a blocking read bypass our deadline.
+
+        Most curl_cffi streaming responses expose ``response.queue`` and are handled above.
+        Some proxy/transport combinations do not, and a direct ``iter_content()`` call can
+        block past ``max_duration_secs``. Move the blocking read to a daemon producer so the
+        consumer can keep checking cancellation/timeout and close the underlying stream.
+        """
+        item_queue: queue.Queue[object] = queue.Queue()
+        done = object()
+
+        def _produce() -> None:
+            try:
+                for item in response.iter_content():
+                    item_queue.put(item)
+            except Exception as exc:
+                item_queue.put(exc)
+            finally:
+                item_queue.put(done)
+
+        threading.Thread(target=_produce, name="sse-response-reader", daemon=True).start()
+        while True:
+            _raise_if_timeout()
+            remaining = _remaining_secs()
+            wait_secs = 1.0 if remaining is None else max(0.001, min(1.0, remaining))
+            try:
+                item = item_queue.get(timeout=wait_secs)
+            except queue.Empty:
+                _raise_if_timeout()
+                continue
+            if item is done:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
+    try:
+        for chunk in _iter_chunks():
+            if pending is not None:
+                chunk = pending + chunk
+            lines = chunk.splitlines()
+            pending = lines.pop() if lines and chunk and lines[-1] and lines[-1][-1] == chunk[-1] else None
+            for raw_line in lines:
+                _raise_if_timeout()
+                if not raw_line:
+                    continue
+                line = raw_line.decode("utf-8", errors="ignore") if isinstance(raw_line, bytes) else str(raw_line)
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload:
+                    yield payload
+        if pending:
+            line = pending.decode("utf-8", errors="ignore") if isinstance(pending, bytes) else str(pending)
+            if line.startswith("data:"):
+                payload = line[5:].strip()
+                if payload:
+                    yield payload
+    except Exception as exc:
+        if timeout_secs > 0 and _remaining_secs() is not None and _remaining_secs() <= 0 and not isinstance(exc, TimeoutError):
+            _abort_stream_nonblocking()
+            raise _timeout_error() from exc
+        raise
+    finally:
+        if not aborted:
+            try:
+                response.close()
+            except Exception:
+                pass
 
 
 def save_images_from_text(text: str, prefix: str) -> list[Path]:
@@ -462,6 +654,10 @@ def build_chat_image_markdown_content(image_result: dict[str, object]) -> str:
     markdown_images: list[str] = []
     for index, item in enumerate(image_items, start=1):
         if not isinstance(item, dict):
+            continue
+        image_url = str(item.get("url") or item.get("image_url") or "").strip()
+        if image_url:
+            markdown_images.append(f"![image_{index}]({image_url})")
             continue
         b64_json = str(item.get("b64_json") or "").strip()
         if b64_json:

@@ -1,0 +1,12 @@
+[Unit]
+Description=Backup chatgpt2api application data and configuration
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/opt/chatgpt2api/.env
+Environment=APP_DIR=/opt/chatgpt2api
+Environment=BACKUP_DIR=/opt/chatgpt2api/backups/scheduled
+Environment=BACKUP_RETENTION_COUNT=7
+ExecStart=/opt/chatgpt2api/deploy/backup.sh

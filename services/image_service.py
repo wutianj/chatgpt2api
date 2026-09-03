@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import io
-import shutil
 import threading
-import time
 import zipfile
 from pathlib import Path
 
@@ -12,9 +10,14 @@ from fastapi.responses import FileResponse, Response
 from PIL import Image, ImageOps
 
 from services.config import config
-from services.image_storage_service import image_storage_service
+from services.gallery_view import gallery_page
+from services.image_storage_service import (
+    ImageBatchDeleteError,
+    image_local_path,
+    image_storage_service,
+    normalize_image_relative_path,
+)
 from services.image_tags_service import load_tags, remove_tags
-from utils.log import logger
 
 THUMBNAIL_SIZE = (320, 320)
 
@@ -27,29 +30,6 @@ def _cleanup_empty_dirs(root: Path) -> None:
             pass
 
 
-def _safe_relative_path(path: str) -> str:
-    value = str(path or "").strip().replace("\\", "/").lstrip("/")
-    if not value:
-        raise HTTPException(status_code=404, detail="image not found")
-    parts = Path(value).parts
-    if any(part in {"", ".", ".."} for part in parts):
-        raise HTTPException(status_code=404, detail="image not found")
-    return Path(*parts).as_posix()
-
-
-def _safe_image_path(relative_path: str) -> Path:
-    rel = _safe_relative_path(relative_path)
-    root = config.images_dir.resolve()
-    path = (root / rel).resolve()
-    try:
-        path.relative_to(root)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail="image not found") from exc
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="image not found")
-    return path
-
-
 def get_image_response(relative_path: str) -> FileResponse | Response:
     headers = {
         "Access-Control-Allow-Origin": "*",
@@ -57,17 +37,21 @@ def get_image_response(relative_path: str) -> FileResponse | Response:
         "Access-Control-Allow-Headers": "*",
     }
     if image_storage_service.has_local(relative_path):
-        return FileResponse(_safe_image_path(relative_path), headers=headers)
+        return FileResponse(
+            image_local_path(relative_path, require_file=True),
+            headers=headers,
+        )
     return Response(content=image_storage_service.get_bytes(relative_path), media_type="image/png", headers=headers)
 
 
 def _thumbnail_path(relative_path: str) -> Path:
-    rel = _safe_relative_path(relative_path)
+    rel = normalize_image_relative_path(relative_path)
     return config.image_thumbnails_dir / f"{rel}.png"
 
 
 def thumbnail_url(base_url: str, relative_path: str) -> str:
-    return f"{base_url.rstrip('/')}/image-thumbnails/{_safe_relative_path(relative_path)}"
+    rel = normalize_image_relative_path(relative_path)
+    return f"{base_url.rstrip('/')}/image-thumbnails/{rel}"
 
 
 def _image_dimensions(path: Path) -> tuple[int, int] | None:
@@ -83,7 +67,7 @@ def ensure_thumbnail(relative_path: str) -> Path:
     source_mtime = 0.0
     source: Path | None = None
     if image_storage_service.has_local(relative_path):
-        source = _safe_image_path(relative_path)
+        source = image_local_path(relative_path, require_file=True)
         source_mtime = source.stat().st_mtime
     if target.exists() and (not source_mtime or target.stat().st_mtime >= source_mtime):
         return target
@@ -120,10 +104,10 @@ def get_image_download_response(relative_path: str) -> FileResponse:
         "Access-Control-Allow-Headers": "*",
     }
     if image_storage_service.has_local(relative_path):
-        path = _safe_image_path(relative_path)
+        path = image_local_path(relative_path, require_file=True)
         headers = {**cors_headers, "Content-Disposition": f'attachment; filename="{path.name}"'}
         return FileResponse(path, filename=path.name, headers=headers)
-    rel = _safe_relative_path(relative_path)
+    rel = normalize_image_relative_path(relative_path)
     headers = {
         **cors_headers,
         "Content-Disposition": f'attachment; filename="{Path(rel).name}"',
@@ -138,33 +122,139 @@ def get_image_download_response(relative_path: str) -> FileResponse:
 def cleanup_image_thumbnails() -> int:
     thumbnails_root = config.image_thumbnails_dir
     removed = 0
+    candidates: dict[Path, str] = {}
     for path in thumbnails_root.rglob("*"):
         if not path.is_file():
             continue
         rel = path.relative_to(thumbnails_root).as_posix()
-        if not rel.endswith(".png") or not image_storage_service.exists(rel[:-4]):
+        if not rel.endswith(".png"):
+            path.unlink()
+            removed += 1
+            continue
+        candidates[path] = rel[:-4]
+
+    existing = image_storage_service.existing_paths(list(candidates.values()))
+    for path, rel in candidates.items():
+        if rel not in existing:
             path.unlink()
             removed += 1
     _cleanup_empty_dirs(thumbnails_root)
     return removed
 
-def list_images(base_url: str, start_date: str = "", end_date: str = "") -> dict[str, object]:
-    config.cleanup_old_images()
-    cleanup_image_thumbnails()
-    all_tags = load_tags()
-    items = [
-        {
-            **item,
-            "url": str(item.get("url") or f"{base_url.rstrip('/')}/images/{item['path']}"),
-            "thumbnail_url": thumbnail_url(base_url, str(item["path"])),
-            "tags": all_tags.get(str(item["path"]), []),
-        }
-        for item in image_storage_service.list_items(base_url, start_date, end_date)
+
+def _retention_hours(value: int | float | str | None, fallback: int) -> int:
+    try:
+        return max(1, int(float(value or fallback)))
+    except (TypeError, ValueError):
+        return max(1, int(fallback))
+
+
+def _retention_cleanup_targets(retention_hours: int) -> list[tuple[str, int]]:
+    hours = _retention_hours(retention_hours, config.image_retention_hours)
+    raw_items = image_storage_service.list_items("", refresh_index=True, verify_existing=True)
+    projection = gallery_page(
+        raw_items,
+        base_url="",
+        tags_by_path={},
+        retention_hours=hours,
+        limit=0,
+        offset=0,
+        media_type="all",
+    )
+    return [
+        (str(item["path"]), int(item["size_bytes"]))
+        for item in projection["items"]
+        if item["expired"] and item["local"]
     ]
-    groups: dict[str, list[dict[str, object]]] = {}
-    for item in items:
-        groups.setdefault(str(item["date"]), []).append(item)
-    return {"items": items, "groups": [{"date": key, "items": value} for key, value in groups.items()]}
+
+
+def preview_image_retention_cleanup(retention_hours: int | None = None) -> dict[str, int | bool]:
+    hours = _retention_hours(retention_hours, config.image_retention_hours)
+    targets = _retention_cleanup_targets(hours)
+    return {
+        "removed": len(targets),
+        "removed_size_bytes": sum(size for _, size in targets),
+        "retention_hours": hours,
+        "dry_run": True,
+    }
+
+
+def cleanup_image_retention(retention_hours: int | None = None) -> dict[str, int | bool]:
+    hours = _retention_hours(retention_hours, config.image_retention_hours)
+    targets = _retention_cleanup_targets(hours)
+    removed = 0
+    removed_size_bytes = 0
+    target_sizes = dict(targets)
+    removed_local = image_storage_service.delete_local_copies(list(target_sizes))
+    for rel, remote_remains in removed_local.items():
+        removed += 1
+        removed_size_bytes += target_sizes.get(rel, 0)
+        if remote_remains:
+            continue
+        for thumbnail in (
+            _thumbnail_path(rel),
+            config.image_thumbnails_dir / normalize_image_relative_path(rel),
+        ):
+            if thumbnail.is_file():
+                thumbnail.unlink()
+        remove_tags(rel)
+    cleanup_image_thumbnails()
+    _cleanup_empty_dirs(config.images_dir)
+    _cleanup_empty_dirs(config.image_thumbnails_dir)
+    return {
+        "removed": removed,
+        "removed_size_bytes": removed_size_bytes,
+        "retention_hours": hours,
+        "dry_run": False,
+    }
+
+
+def cleanup_expired_images(retention_hours: int | None = None) -> dict[str, int]:
+    from services.retention_cleanup_service import retention_cleanup_coordinator
+
+    result = retention_cleanup_coordinator.run_images(retention_hours)
+    return {
+        "removed": int(result["removed"]),
+        "removed_size_bytes": int(result["removed_size_bytes"]),
+        "retention_hours": int(result["retention_hours"]),
+    }
+
+
+def list_images(
+    base_url: str,
+    start_date: str = "",
+    end_date: str = "",
+    *,
+    limit: int = 0,
+    offset: int = 0,
+    media_type: str = "all",
+    tag: str = "",
+    search: str = "",
+) -> dict[str, object]:
+    paged = int(limit or 0) > 0
+    raw_items = image_storage_service.list_items(
+        base_url,
+        start_date,
+        end_date,
+        refresh_index=not paged,
+        verify_existing=not paged,
+    )
+    wanted_type = str(media_type or "all").strip().lower()
+    if wanted_type not in {"all", "image"}:
+        wanted_type = "all"
+    genbox_push_settings = config.get_genbox_push_settings()
+    return gallery_page(
+        raw_items,
+        base_url=base_url,
+        tags_by_path=load_tags(),
+        retention_hours=config.image_retention_hours,
+        limit=limit,
+        offset=offset,
+        media_type=wanted_type,
+        genbox_push_enabled=bool(genbox_push_settings.get("enabled")),
+        tag=tag,
+        search=search,
+    )
 
 
 def delete_images(paths: list[str] | None = None, start_date: str = "", end_date: str = "", all_matching: bool = False) -> dict[str, int]:
@@ -173,22 +263,37 @@ def delete_images(paths: list[str] | None = None, start_date: str = "", end_date
         str(item["path"])
         for item in image_storage_service.list_items("", start_date=start_date, end_date=end_date)
     ] if all_matching else (paths or [])
-    removed = 0
+    valid_targets: list[str] = []
     for item in targets:
         path = (root / item).resolve()
         try:
             path.relative_to(root)
         except ValueError:
             continue
-        if image_storage_service.delete(item):
-            removed += 1
-        for thumbnail in (_thumbnail_path(item), config.image_thumbnails_dir / _safe_relative_path(item)):
+        valid_targets.append(item)
+
+    terminal_error: Exception | None = None
+    try:
+        removed_paths = image_storage_service.delete_many(valid_targets)
+        completed_targets = valid_targets
+    except ImageBatchDeleteError as exc:
+        removed_paths = set()
+        completed_targets = list(exc.completed_rels)
+        terminal_error = exc.cause
+
+    for item in completed_targets:
+        for thumbnail in (
+            _thumbnail_path(item),
+            config.image_thumbnails_dir / normalize_image_relative_path(item),
+        ):
             if thumbnail.is_file():
                 thumbnail.unlink()
         remove_tags(item)
+    if terminal_error is not None:
+        raise terminal_error
     _cleanup_empty_dirs(root)
     _cleanup_empty_dirs(config.image_thumbnails_dir)
-    return {"removed": removed}
+    return {"removed": len(removed_paths)}
 
 
 def download_images_zip(paths: list[str]) -> io.BytesIO:
@@ -198,20 +303,17 @@ def download_images_zip(paths: list[str]) -> io.BytesIO:
     used_names: set[str] = set()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for item in paths:
-            rel = _safe_relative_path(item)
+            rel = normalize_image_relative_path(item)
             path = (root / rel).resolve()
             payload: bytes | None = None
             try:
                 path.relative_to(root)
             except ValueError:
                 continue
-            if path.is_file():
-                payload = path.read_bytes()
-            else:
-                try:
-                    payload = image_storage_service.get_bytes(rel)
-                except Exception:
-                    continue
+            try:
+                payload = image_storage_service.get_bytes(rel)
+            except Exception:
+                continue
             name = path.name
             if name in used_names:
                 stem = path.stem
@@ -253,124 +355,63 @@ def storage_stats() -> dict:
 
 def compress_images(quality: int = 60) -> dict:
     """重新压缩所有图片，返回节省的空间"""
-    saved = 0
-    count = 0
-    for p in sorted(config.images_dir.rglob("*.png")):
-        if not p.is_file():
-            continue
-        try:
-            orig = p.stat().st_size
-            with Image.open(p) as img:
-                img = ImageOps.exif_transpose(img)
-                img.save(str(p) + ".tmp", format="PNG", optimize=True)
-            new_size = Path(str(p) + ".tmp").stat().st_size
-            if new_size < orig:
-                Path(str(p) + ".tmp").replace(p)
-                saved += orig - new_size
-                count += 1
-            else:
-                Path(str(p) + ".tmp").unlink()
-        except Exception:
-            pass
-    return {"compressed": count, "saved_bytes": saved, "saved_mb": saved // (1024 * 1024)}
+    return image_storage_service.compress_local_images(quality)
 
 
 def delete_to_target(target_free_mb: int, dry_run: bool = False) -> dict:
     """删除最旧的图片直到剩余空间达到 target_free_mb"""
     import shutil
     usage = shutil.disk_usage(config.images_dir)
-    current_free = usage.free // (1024 * 1024)
-    if current_free >= target_free_mb and not dry_run:
+    mebibyte = 1024 * 1024
+    target_free_bytes = max(0, int(target_free_mb)) * mebibyte
+    current_free_bytes = int(usage.free)
+    current_free = current_free_bytes // mebibyte
+    if current_free_bytes >= target_free_bytes and not dry_run:
         return {"removed": 0, "current_free_mb": current_free, "target_free_mb": target_free_mb, "done": True}
 
     files = sorted(
         (p for p in config.images_dir.rglob("*.png") if p.is_file()),
         key=lambda p: p.stat().st_mtime,
     )
-    removed = 0
-    freed = 0
-    for p in files:
-        if current_free + freed // (1024 * 1024) >= target_free_mb:
-            break
-        size = p.stat().st_size
-        if not dry_run:
-            rel = p.relative_to(config.images_dir).as_posix()
-            for tp in (_thumbnail_path(rel), config.image_thumbnails_dir / _safe_relative_path(rel)):
-                if tp.is_file():
-                    tp.unlink()
+    removals = image_storage_service.delete_local_copies_until(
+        [p.relative_to(config.images_dir).as_posix() for p in files],
+        max(0, target_free_bytes - current_free_bytes),
+        dry_run=dry_run,
+    )
+    freed = sum(removal.size for removal in removals)
+    for removal in removals:
+        if dry_run:
+            continue
+        rel = removal.rel
+        for thumbnail in (
+            _thumbnail_path(rel),
+            config.image_thumbnails_dir / normalize_image_relative_path(rel),
+        ):
+            if thumbnail.is_file():
+                thumbnail.unlink()
+        if not removal.remote_remains:
             remove_tags(rel)
-            p.unlink()
-        freed += size
-        removed += 1
 
     if not dry_run:
         _cleanup_empty_dirs(config.images_dir)
         _cleanup_empty_dirs(config.image_thumbnails_dir)
 
     return {
-        "removed": removed,
-        "freed_mb": freed // (1024 * 1024),
+        "removed": len(removals),
+        "freed_mb": freed // mebibyte,
         "target_free_mb": target_free_mb,
-        "current_free_mb": current_free + (freed // (1024 * 1024)),
-        "done": (current_free + freed // (1024 * 1024)) >= target_free_mb,
+        "current_free_mb": (current_free_bytes + freed) // mebibyte,
+        "done": current_free_bytes + freed >= target_free_bytes,
         "dry_run": dry_run,
     }
 
-
-def download_images_zip(paths: list[str]) -> io.BytesIO:
-    root = config.images_dir.resolve()
-    buf = io.BytesIO()
-    added = 0
-    used_names: set[str] = set()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for item in paths:
-            rel = _safe_relative_path(item)
-            path = (root / rel).resolve()
-            try:
-                path.relative_to(root)
-            except ValueError:
-                continue
-            if not path.is_file():
-                continue
-            name = path.name
-            if name in used_names:
-                stem = path.stem
-                suffix = path.suffix
-                counter = 2
-                while f"{stem}_{counter}{suffix}" in used_names:
-                    counter += 1
-                name = f"{stem}_{counter}{suffix}"
-            used_names.add(name)
-            zf.write(path, name)
-            added += 1
-    if added == 0:
-        raise HTTPException(status_code=404, detail="no images found")
-    buf.seek(0)
-    return buf
-
-
 def _auto_cleanup_worker(stop_event: threading.Event) -> None:
-    """后台线程：每30分钟检查存储，空间低于阈值自动清理最旧图片"""
-    import shutil
-    min_free_mb = getattr(config, "image_min_free_mb", None)
-    if min_free_mb is None:
-        min_free_mb = 500
+    from services.retention_cleanup_service import retention_cleanup_coordinator
 
-    while not stop_event.wait(1800):  # 每30分钟
-        try:
-            config.cleanup_old_images()
-            cleanup_image_thumbnails()
-            usage = shutil.disk_usage(config.images_dir)
-            free_mb = usage.free // (1024 * 1024)
-            if free_mb < min_free_mb:
-                logger.info({"event": "image_auto_cleanup", "free_mb": free_mb, "min_free_mb": min_free_mb})
-                result = delete_to_target(min_free_mb)
-                logger.info({"event": "image_auto_cleanup_done", **result})
-        except Exception:
-            pass
+    retention_cleanup_coordinator.scheduler_worker(stop_event)
 
 
 def start_image_cleanup_scheduler(stop_event: threading.Event) -> threading.Thread:
-    t = threading.Thread(target=_auto_cleanup_worker, args=(stop_event,), daemon=True, name="image-cleanup")
-    t.start()
-    return t
+    from services.retention_cleanup_service import start_retention_cleanup_scheduler
+
+    return start_retention_cleanup_scheduler(stop_event)

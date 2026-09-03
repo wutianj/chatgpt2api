@@ -6,12 +6,20 @@ import secrets
 import uuid
 from datetime import datetime, timezone
 from threading import Lock
+from time import monotonic
 from typing import Literal
 
 from services.config import config
-from services.storage.base import StorageBackend
+from services.storage.base import (
+    StorageBackend,
+    StorageMutation,
+    StorageRevisionConflictError,
+)
 
 AuthRole = Literal["admin", "user"]
+_CAS_ATTEMPTS = 4
+_AUTH_SNAPSHOT_REFRESH_INTERVAL_SECONDS = 5.0
+_AUTH_SNAPSHOT_MAX_STALE_SECONDS = 30.0
 
 
 def _now_iso() -> str:
@@ -26,8 +34,13 @@ class AuthService:
     def __init__(self, storage: StorageBackend):
         self.storage = storage
         self._lock = Lock()
-        self._items = self._load()
+        self._snapshot_refresh_lock = Lock()
+        self._items: list[dict[str, object]] = []
+        self._revision: str | None = None
         self._last_used_flush_at: dict[str, datetime] = {}
+        self._last_snapshot_refresh_attempt_at = 0.0
+        self._last_snapshot_refresh_success_at = 0.0
+        self._reload_locked(suppress_errors=True)
 
     @staticmethod
     def _clean(value: object) -> str:
@@ -46,7 +59,9 @@ class AuthService:
         key_hash = self._clean(raw.get("key_hash"))
         if not key_hash:
             return None
-        item_id = self._clean(raw.get("id")) or uuid.uuid4().hex[:12]
+        item_id = self._clean(raw.get("id"))
+        if not item_id:
+            return None
         name = self._clean(raw.get("name")) or self._default_name(role)
         created_at = self._clean(raw.get("created_at")) or _now_iso()
         last_used_at = self._clean(raw.get("last_used_at")) or None
@@ -60,20 +75,117 @@ class AuthService:
             "last_used_at": last_used_at,
         }
 
-    def _load(self) -> list[dict[str, object]]:
+    def _load_snapshot(self) -> tuple[list[dict[str, object]], str]:
+        snapshot = self.storage.load_auth_keys_snapshot()
+        items = snapshot.items if isinstance(snapshot.items, list) else []
+        normalized = [
+            normalized_item
+            for item in items
+            if (normalized_item := self._normalize_item(item)) is not None
+        ]
+        return normalized, snapshot.revision
+
+    def _reload_locked(self, *, suppress_errors: bool = False) -> bool:
         try:
-            items = self.storage.load_auth_keys()
+            items, revision = self._load_snapshot()
         except Exception:
-            return []
-        if not isinstance(items, list):
-            return []
-        return [normalized for item in items if (normalized := self._normalize_item(item)) is not None]
+            if suppress_errors:
+                return False
+            raise
+        self._items = items
+        self._revision = revision
+        refreshed_at = monotonic()
+        self._last_snapshot_refresh_attempt_at = refreshed_at
+        self._last_snapshot_refresh_success_at = refreshed_at
+        return True
 
-    def _save(self) -> None:
-        self.storage.save_auth_keys(self._items)
+    def _snapshot_is_usable(self, now: float | None = None) -> bool:
+        checked_at = monotonic() if now is None else now
+        return (
+            self._last_snapshot_refresh_success_at > 0
+            and checked_at - self._last_snapshot_refresh_success_at
+            <= _AUTH_SNAPSHOT_MAX_STALE_SECONDS
+        )
 
-    def _reload_locked(self) -> None:
-        self._items = self._load()
+    def _refresh_snapshot_if_due(self) -> bool:
+        now = monotonic()
+        if (
+            now - self._last_snapshot_refresh_attempt_at
+            < _AUTH_SNAPSHOT_REFRESH_INTERVAL_SECONDS
+        ):
+            return self._snapshot_is_usable(now)
+        if not self._snapshot_refresh_lock.acquire(blocking=False):
+            return self._snapshot_is_usable(now)
+        try:
+            now = monotonic()
+            if (
+                now - self._last_snapshot_refresh_attempt_at
+                < _AUTH_SNAPSHOT_REFRESH_INTERVAL_SECONDS
+            ):
+                return self._snapshot_is_usable(now)
+            self._last_snapshot_refresh_attempt_at = now
+            with self._lock:
+                expected_local_revision = self._revision
+            try:
+                items, revision = self._load_snapshot()
+            except Exception:
+                return self._snapshot_is_usable()
+            with self._lock:
+                if self._revision != expected_local_revision:
+                    return self._snapshot_is_usable()
+                self._items = items
+                self._revision = revision
+                self._last_snapshot_refresh_success_at = monotonic()
+                active_ids = {self._clean(item.get("id")) for item in items}
+                self._last_used_flush_at = {
+                    item_id: flushed_at
+                    for item_id, flushed_at in self._last_used_flush_at.items()
+                    if item_id in active_ids
+                }
+                return True
+        finally:
+            self._snapshot_refresh_lock.release()
+
+    def _set_cached_item_locked(self, item: dict[str, object], revision: str) -> None:
+        item_id = self._clean(item.get("id"))
+        self._items = [
+            current
+            for current in self._items
+            if self._clean(current.get("id")) != item_id
+        ]
+        self._items.append(item)
+        self._revision = revision
+
+    def _delete_cached_item_locked(self, item_id: str, revision: str) -> None:
+        self._items = [
+            item
+            for item in self._items
+            if self._clean(item.get("id")) != item_id
+        ]
+        self._revision = revision
+
+    def _find_item_index_locked(
+        self,
+        item_id: str,
+        *,
+        role: AuthRole | None = None,
+    ) -> int | None:
+        for index, item in enumerate(self._items):
+            if self._clean(item.get("id")) != item_id:
+                continue
+            if role is not None and item.get("role") != role:
+                return None
+            return index
+        return None
+
+    def _find_hash_index_locked(self, candidate_hash: str) -> int | None:
+        for index, item in enumerate(self._items):
+            if not bool(item.get("enabled", True)):
+                continue
+            stored_hash = self._clean(item.get("key_hash"))
+            if stored_hash and hmac.compare_digest(stored_hash, candidate_hash):
+                return index
+        return None
 
     @staticmethod
     def _public_item(item: dict[str, object]) -> dict[str, object]:
@@ -88,7 +200,7 @@ class AuthService:
 
     def list_keys(self, role: AuthRole | None = None) -> list[dict[str, object]]:
         with self._lock:
-            self._reload_locked()
+            self._reload_locked(suppress_errors=True)
             items = [item for item in self._items if role is None or item.get("role") == role]
             return [self._public_item(item) for item in items]
 
@@ -149,27 +261,44 @@ class AuthService:
 
     def create_key(self, *, role: AuthRole, name: str = "") -> tuple[dict[str, object], str]:
         with self._lock:
-            self._reload_locked()
-            normalized_name = self._build_name_locked(name, role=role)
-            while True:
-                raw_key = f"sk-{secrets.token_urlsafe(24)}"
+            for attempt in range(_CAS_ATTEMPTS):
+                self._reload_locked()
+                normalized_name = self._build_name_locked(name, role=role)
+                while True:
+                    raw_key = f"sk-{secrets.token_urlsafe(24)}"
+                    try:
+                        key_hash = self._build_key_hash_locked(raw_key)
+                        break
+                    except ValueError:
+                        continue
+                existing_ids = {self._clean(item.get("id")) for item in self._items}
+                while True:
+                    item_id = uuid.uuid4().hex[:12]
+                    if item_id not in existing_ids:
+                        break
+                item = {
+                    "id": item_id,
+                    "name": normalized_name,
+                    "role": role,
+                    "key_hash": key_hash,
+                    "enabled": True,
+                    "created_at": _now_iso(),
+                    "last_used_at": None,
+                }
                 try:
-                    key_hash = self._build_key_hash_locked(raw_key)
-                    break
-                except ValueError:
+                    result = self.storage.mutate_auth_keys(
+                        StorageMutation(
+                            upserts=(item,),
+                            expected_revision=self._revision,
+                        )
+                    )
+                except StorageRevisionConflictError:
+                    if attempt + 1 >= _CAS_ATTEMPTS:
+                        raise
                     continue
-            item = {
-                "id": uuid.uuid4().hex[:12],
-                "name": normalized_name,
-                "role": role,
-                "key_hash": key_hash,
-                "enabled": True,
-                "created_at": _now_iso(),
-                "last_used_at": None,
-            }
-            self._items.append(item)
-            self._save()
-            return self._public_item(item), raw_key
+                self._set_cached_item_locked(item, result.revision)
+                return self._public_item(item), raw_key
+        raise RuntimeError("auth key mutation retry exhausted")
 
     def update_key(
         self,
@@ -182,13 +311,12 @@ class AuthService:
         if not normalized_id:
             return None
         with self._lock:
-            self._reload_locked()
-            for index, item in enumerate(self._items):
-                if item.get("id") != normalized_id:
-                    continue
-                if role is not None and item.get("role") != role:
+            for attempt in range(_CAS_ATTEMPTS):
+                self._reload_locked()
+                index = self._find_item_index_locked(normalized_id, role=role)
+                if index is None:
                     return None
-                next_item = dict(item)
+                next_item = dict(self._items[index])
                 next_role = "admin" if str(next_item.get("role") or "").strip().lower() == "admin" else "user"
                 if "name" in updates and updates.get("name") is not None:
                     next_item["name"] = self._build_name_locked(
@@ -200,8 +328,18 @@ class AuthService:
                     next_item["enabled"] = bool(updates.get("enabled"))
                 if "key" in updates and updates.get("key") is not None:
                     next_item["key_hash"] = self._build_key_hash_locked(str(updates.get("key") or ""), exclude_id=normalized_id)
-                self._items[index] = next_item
-                self._save()
+                try:
+                    result = self.storage.mutate_auth_keys(
+                        StorageMutation(
+                            upserts=(next_item,),
+                            expected_revision=self._revision,
+                        )
+                    )
+                except StorageRevisionConflictError:
+                    if attempt + 1 >= _CAS_ATTEMPTS:
+                        raise
+                    continue
+                self._set_cached_item_locked(next_item, result.revision)
                 return self._public_item(next_item)
         return None
 
@@ -210,42 +348,75 @@ class AuthService:
         if not normalized_id:
             return False
         with self._lock:
-            self._reload_locked()
-            before = len(self._items)
-            self._items = [
-                item
-                for item in self._items
-                if not (item.get("id") == normalized_id and (role is None or item.get("role") == role))
-            ]
-            if len(self._items) == before:
-                return False
-            self._save()
-            return True
+            for attempt in range(_CAS_ATTEMPTS):
+                self._reload_locked()
+                if self._find_item_index_locked(normalized_id, role=role) is None:
+                    return False
+                try:
+                    result = self.storage.mutate_auth_keys(
+                        StorageMutation(
+                            delete_keys=(normalized_id,),
+                            expected_revision=self._revision,
+                        )
+                    )
+                except StorageRevisionConflictError:
+                    if attempt + 1 >= _CAS_ATTEMPTS:
+                        raise
+                    continue
+                self._delete_cached_item_locked(normalized_id, result.revision)
+                self._last_used_flush_at.pop(normalized_id, None)
+                return result.deleted > 0
+        return False
 
     def authenticate(self, raw_key: str) -> dict[str, object] | None:
         candidate = self._clean(raw_key)
         if not candidate:
             return None
         candidate_hash = _hash_key(candidate)
+        if not self._refresh_snapshot_if_due():
+            return None
         with self._lock:
-            for index, item in enumerate(self._items):
-                if not bool(item.get("enabled", True)):
-                    continue
-                stored_hash = self._clean(item.get("key_hash"))
-                if not stored_hash or not hmac.compare_digest(stored_hash, candidate_hash):
-                    continue
-                next_item = dict(item)
-                now = datetime.now(timezone.utc)
+            now = datetime.now(timezone.utc)
+            for attempt in range(_CAS_ATTEMPTS):
+                index = self._find_hash_index_locked(candidate_hash)
+                if index is None:
+                    return None
+                next_item = dict(self._items[index])
                 next_item["last_used_at"] = now.isoformat()
-                self._items[index] = next_item
                 item_id = self._clean(next_item.get("id"))
                 last_flush_at = self._last_used_flush_at.get(item_id)
-                if last_flush_at is None or (now - last_flush_at).total_seconds() >= 60:
+                if last_flush_at is not None and (now - last_flush_at).total_seconds() < 60:
+                    self._items[index] = next_item
+                    return self._public_item(next_item)
+                if self._revision is None:
+                    self._items[index] = next_item
+                    return self._public_item(next_item)
+                try:
+                    result = self.storage.mutate_auth_keys(
+                        StorageMutation(
+                            upserts=(next_item,),
+                            expected_revision=self._revision,
+                        )
+                    )
+                except StorageRevisionConflictError:
                     try:
-                        self._save()
-                        self._last_used_flush_at[item_id] = now
+                        self._reload_locked()
                     except Exception:
-                        pass
+                        return None
+                    refreshed_index = self._find_hash_index_locked(candidate_hash)
+                    if refreshed_index is None:
+                        return None
+                    if attempt + 1 >= _CAS_ATTEMPTS:
+                        validated_item = dict(self._items[refreshed_index])
+                        validated_item["last_used_at"] = now.isoformat()
+                        self._items[refreshed_index] = validated_item
+                        return self._public_item(validated_item)
+                    continue
+                except Exception:
+                    self._items[index] = next_item
+                    return self._public_item(next_item)
+                self._set_cached_item_locked(next_item, result.revision)
+                self._last_used_flush_at[item_id] = now
                 return self._public_item(next_item)
         return None
 

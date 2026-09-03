@@ -19,6 +19,7 @@ from services.protocol.conversation import (
     stream_text_deltas,
     text_backend,
 )
+from services.protocol.reasoning import thinking_effort_from_body
 from services.protocol.web_search_tool import (
     WEB_SEARCH_TOOL_TYPES,
     has_unsupported_tools,
@@ -43,28 +44,6 @@ TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
 )
 
 RESPONSE_CONTENT_PART_TYPES = {"text", "input_text", "output_text", "image_url", "input_image", "image"}
-
-
-def normalize_thinking_effort(value: object) -> str:
-    normalized = str(value or "").strip().lower()
-    if normalized in {"", "none"}:
-        return ""
-    if normalized in {"low", "medium", "high"}:
-        return normalized
-    if normalized in {"xhigh", "extended"}:
-        return "extended"
-    return ""
-
-
-def thinking_effort_from_body(body: dict[str, Any]) -> str:
-    reasoning = body.get("reasoning")
-    if isinstance(reasoning, dict):
-        return normalize_thinking_effort(reasoning.get("effort"))
-    if "thinking_effort" in body:
-        return normalize_thinking_effort(body.get("thinking_effort"))
-    if "reasoning_effort" in body:
-        return normalize_thinking_effort(body.get("reasoning_effort"))
-    return ""
 
 
 def is_text_response_request(body: dict[str, Any]) -> bool:
@@ -288,6 +267,30 @@ def response_completed(
     return response
 
 
+def _with_log_metadata(
+    payload: dict[str, Any],
+    account_email: str = "",
+    conversation_id: str = "",
+    image_urls: Iterable[str] | None = None,
+    image_attempts: Iterable[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    if account_email:
+        payload["_account_email"] = account_email
+    if conversation_id:
+        payload["_conversation_id"] = conversation_id
+    urls = [str(url).strip() for url in image_urls or [] if str(url).strip()]
+    if urls:
+        payload["_image_urls"] = list(dict.fromkeys(urls))
+    attempts = [dict(item) for item in image_attempts or [] if isinstance(item, dict)]
+    if attempts:
+        payload["_image_attempts"] = attempts
+    return payload
+
+
+def _backend_account_email(backend: object) -> str:
+    return str(getattr(backend, "account_email", "") or "").strip()
+
+
 def text_response_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     model = str(body.get("model") or "auto").strip() or "auto"
     messages = normalize_text_messages(normalize_messages(messages_from_input(body.get("input"), body.get("instructions"))))
@@ -309,16 +312,25 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
     request = ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)
     for delta in stream_text_deltas(backend, request):
         full_text += delta
-        yield {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": delta}
-    yield {"type": "response.output_text.done", "item_id": item_id, "output_index": 0, "content_index": 0, "text": full_text}
+        yield _with_log_metadata(
+            {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": delta},
+            _backend_account_email(backend),
+        )
+    yield _with_log_metadata(
+        {"type": "response.output_text.done", "item_id": item_id, "output_index": 0, "content_index": 0, "text": full_text},
+        _backend_account_email(backend),
+    )
     item = text_output_item(full_text, item_id, "completed")
-    yield {"type": "response.output_item.done", "output_index": 0, "item": item}
+    yield _with_log_metadata({"type": "response.output_item.done", "output_index": 0, "item": item}, _backend_account_email(backend))
     usage = token_usage(
         input_text_tokens=count_message_text_tokens(messages, model),
         input_image_tokens=count_message_image_tokens(messages, model),
         output_text_tokens=count_text_tokens(full_text, model),
     )
-    yield response_completed(response_id, model, created, [item], usage)
+    completed = response_completed(response_id, model, created, [item], usage)
+    _with_log_metadata(completed, _backend_account_email(backend))
+    _with_log_metadata(completed["response"], _backend_account_email(backend))
+    yield completed
 
 
 def stream_web_search_response(body: dict[str, Any], messages: list[dict[str, Any]] | None = None) -> Iterator[dict[str, Any]]:
@@ -366,6 +378,7 @@ def stream_image_response(
     input_image_tokens: int = 0,
     size: object = None,
     quality: str = "auto",
+    resolution_callback: Any = None,
 ) -> Iterator[dict[str, Any]]:
     response_id = f"resp_{uuid.uuid4().hex}"
     created = int(time.time())
@@ -379,23 +392,58 @@ def stream_image_response(
                 input_image_tokens=input_image_tokens,
                 output_text_tokens=count_text_tokens(text, model),
             )
-            yield {"type": "response.output_text.delta", "item_id": item["id"], "output_index": 0, "content_index": 0, "delta": text}
-            yield {"type": "response.output_text.done", "item_id": item["id"], "output_index": 0, "content_index": 0, "text": text}
-            yield {"type": "response.output_item.done", "output_index": 0, "item": item}
-            yield response_completed(response_id, model, created, [item], usage)
+            yield _with_log_metadata(
+                {"type": "response.output_text.delta", "item_id": item["id"], "output_index": 0, "content_index": 0, "delta": text},
+                output.account_email,
+                output.conversation_id,
+                image_attempts=output.image_attempts,
+            )
+            yield _with_log_metadata(
+                {"type": "response.output_text.done", "item_id": item["id"], "output_index": 0, "content_index": 0, "text": text},
+                output.account_email,
+                output.conversation_id,
+                image_attempts=output.image_attempts,
+            )
+            yield _with_log_metadata(
+                {"type": "response.output_item.done", "output_index": 0, "item": item},
+                output.account_email,
+                output.conversation_id,
+                image_attempts=output.image_attempts,
+            )
+            completed = response_completed(response_id, model, created, [item], usage)
+            if output.notice:
+                completed["notice"] = output.notice
+                completed["response"]["notice"] = output.notice
+            _with_log_metadata(completed, output.account_email, output.conversation_id, image_attempts=output.image_attempts)
+            _with_log_metadata(completed["response"], output.account_email, output.conversation_id, image_attempts=output.image_attempts)
+            yield completed
             return
         if output.kind != "result":
             continue
         items = image_output_items(prompt, output.data)
         if items:
+            if callable(resolution_callback) and output.resolved_size:
+                resolution_callback([output.resolved_size] * len(output.data))
             usage = image_usage(
                 input_text_tokens=count_text_tokens(prompt, model),
                 input_image_tokens=input_image_tokens,
                 output_tokens=count_image_output_items_tokens(output.data, size, quality),
             )
             for output_index, item in enumerate(items):
-                yield {"type": "response.output_item.done", "output_index": output_index, "item": item}
-            yield response_completed(response_id, model, created, items, usage)
+                yield _with_log_metadata(
+                    {"type": "response.output_item.done", "output_index": output_index, "item": item},
+                    output.account_email,
+                    output.conversation_id,
+                    output.image_urls,
+                    output.image_attempts,
+                )
+            completed = response_completed(response_id, model, created, items, usage)
+            if output.notice:
+                completed["notice"] = output.notice
+                completed["response"]["notice"] = output.notice
+            _with_log_metadata(completed, output.account_email, output.conversation_id, output.image_urls, output.image_attempts)
+            _with_log_metadata(completed["response"], output.account_email, output.conversation_id, output.image_urls, output.image_attempts)
+            yield completed
             return
     raise RuntimeError("image generation failed")
 
@@ -419,7 +467,7 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         key = cache_key(body, messages, stream=bool(body.get("stream")))
         yield from chat_completion_cache.get_or_compute_stream(
             key,
-            lambda: stream_text_response(text_backend(model), body, messages),
+            lambda: stream_text_response(text_backend(), body, messages),
         )
         return
 
@@ -442,8 +490,19 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         quality=str(tool.get("quality") or "auto"),
         response_format="b64_json",
         images=images,
+        message_as_error=True,
+        call_id=str(body.get("_call_id") or ""),
+        trace_image_perf=bool(body.get("_trace_image_perf")),
     ))
-    yield from stream_image_response(image_outputs, prompt, model, input_image_tokens, tool.get("size"), str(tool.get("quality") or "auto"))
+    yield from stream_image_response(
+        image_outputs,
+        prompt,
+        model,
+        input_image_tokens,
+        tool.get("size"),
+        str(tool.get("quality") or "auto"),
+        body.get("_billing_resolution_callback"),
+    )
 
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
